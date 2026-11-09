@@ -88,6 +88,21 @@ const stop = agent.observe((event) => {
 
 Every adapter reports `turn.started`, `turn.completed` and `turn.failed`, `room.joined`, `room.left` and `room.stopped`, and `link.connected` and `link.disconnected` (`dropped` while the socket retries on its own, `closed` on a local disconnect, `terminal` when it ended for good). `ACPClientAdapter` and its subclasses also report what their agent streams as it arrives: `thought` and `message` text, `tool.call` and `tool.result`, `approval.requested` and `approval.resolved`, and `room.failed` when the room's agent process cannot start or exits on its own. Each tool call is reported once, when its arguments arrive (or just before its result, for a call that has none), and named by the agent's own tool name when its ACP bridge reports one, else by its ACP `kind` — never by its display title, which can hold a whole command line. Arguments and results are passed through as the agent sent them, so redact them before logging. Listeners run synchronously in event order, so keep them quick; one that throws or rejects is logged and skipped without failing the turn or the other listeners.
 
+### Reading a room's history
+
+`tools.readRoomHistory({ cursor?, limit? })` returns one page of the room's messages of every type, newest first, and a `nextCursor` for the next older page (`null` at the room's first message). Pages hold 20 messages by default and at most 100. During a turn the runtime pins the turn's own inbound message first on every page, so the agent always sees what it is answering, and never repeats it within the page that holds it. The read calls Band's agent message list with `status=all&sort_order=desc`. A REST client without that endpoint throws `UnsupportedFeatureError`; it never returns an empty page instead.
+
+It is not a Band tool, so the model does not see it unless a host serves it. On a single-room MCP server, such as each ACP room's own, a host's own MCP tool in `additionalMcpTools` gets that room's tools as the second argument of `execute`, so it can call `readRoomHistory` for that room and turn:
+
+```ts
+const readRoom: McpToolRegistration = {
+  name: "read_room",
+  description: "Read this room's history, newest first.",
+  inputSchema: { type: "object", properties: { cursor: { type: "string" }, limit: { type: "integer" } }, required: [] },
+  execute: async (args, tools) => ({ content: [{ type: "text", text: JSON.stringify(await tools!.readRoomHistory!(args)) }] }),
+};
+```
+
 ### Generic
 
 Bring your own logic with a single async callback:
