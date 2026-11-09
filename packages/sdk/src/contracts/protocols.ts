@@ -1,6 +1,6 @@
 import type { AgentFailure } from "@band-ai/band-sdk-core";
 import { isBlankEventContent, type ChatEventType } from "./chatEvents";
-import type { AgentEventSink } from "./events";
+import type { AgentEventSink, RoomAgentIdentity } from "./events";
 import type {
   GetBoardArgs, SetBoardArgs, ListTasksArgs, CreateTaskArgs, GetTaskArgs, UpdateTaskArgs, WireBoard, WireTask, WireTaskPage,
   AddContactArgs,
@@ -388,10 +388,12 @@ export interface FrameworkAdapter {
   cancelTurn?(roomId: string): Promise<boolean>;
   /**
    * Starts the room's own agent ahead of the room's first message, for
-   * `agent.rooms.allow(roomId, { warm: true })`. Rejects when it cannot
-   * start; the runtime then reports `room.failed` unless the adapter already did.
+   * `agent.rooms.allow(roomId, { warm: true })`, and resolves with what that
+   * agent said about itself when it started, or `null` when it says nothing.
+   * Rejects when it cannot start; the runtime then reports `room.failed`
+   * unless the adapter already did.
    */
-  warmRoom?(roomId: string): Promise<void>;
+  warmRoom?(roomId: string): Promise<RoomAgentIdentity | null>;
   /**
    * Hands the adapter the sink for what only it can see — its agent's
    * thoughts, tool calls, approvals, and room process failures — before

@@ -291,6 +291,11 @@ describe("OmpRpcAdapter", () => {
     expect(omp.peers).toHaveLength(1);
     expect(omp.peers[0]!.received.map((frame) => frame.type)).toEqual(["negotiate_protocol", "get_state", "set_host_tools"]);
     expect(events.filter((event) => "roomId" in event && event.roomId === OTHER_ROOM).map((event) => event.type)).toEqual(["room.ready", "room.joined"]);
+    expect(events.find((event) => event.type === "room.ready")).toEqual({
+      type: "room.ready",
+      roomId: OTHER_ROOM,
+      agent: { protocol: "omp-rpc", protocolVersion: 2 },
+    });
   });
 
   it("reassembles a frame OMP splits into rpc_chunk frames", async () => {

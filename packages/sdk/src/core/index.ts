@@ -33,7 +33,13 @@ export type {
   AdapterToolsProtocol,
   AgentToolsProtocol,
 } from "../contracts/protocols";
-export type { AgentEvent, AgentEventListener, AgentEventSink, AgentEventType } from "../contracts/events";
+export type {
+  AgentEvent,
+  AgentEventListener,
+  AgentEventSink,
+  AgentEventType,
+  RoomAgentIdentity,
+} from "../contracts/events";
 export {
   BandSdkError,
   UnsupportedFeatureError,

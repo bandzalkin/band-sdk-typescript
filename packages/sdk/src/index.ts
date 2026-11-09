@@ -104,6 +104,7 @@ export type {
   AgentEventListener,
   AgentEventSink,
   AgentEventType,
+  RoomAgentIdentity,
 } from "./core";
 
 export type {

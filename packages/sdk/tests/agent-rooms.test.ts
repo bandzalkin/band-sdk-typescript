@@ -130,7 +130,7 @@ describe("agent.rooms", () => {
     expect(roomEvents(ROOM_B)).toEqual(["room.failed", "room.joined"]);
   });
 
-  it("starts a warm room's agent and reports room.ready before the room takes any message", async () => {
+  it("starts a warm room's agent and reports room.ready, with what its handshake named, before the room takes any message", async () => {
     let initialized = 0;
     const adapter = new ACPClientAdapter({
       command: ["acp-fixture"],
@@ -139,7 +139,11 @@ describe("agent.rooms", () => {
       connectionFactory: inMemoryAgent((): AcpAgent => ({
         initialize: async () => {
           initialized += 1;
-          return { protocolVersion: 1, agentCapabilities: {} };
+          return {
+            protocolVersion: 1,
+            agentCapabilities: {},
+            agentInfo: { name: "fixture-acp", title: "Fixture", version: "1.2.3" },
+          };
         },
         authenticate: async () => ({}),
         newSession: async () => ({ sessionId: "session-1" }),
@@ -147,12 +151,48 @@ describe("agent.rooms", () => {
         prompt: async () => ({ stopReason: "end_turn" }),
       })),
     });
-    const { agent, subscribed, roomEvents } = await startAgent(adapter, [ROOM_A]);
+    const { agent, events, subscribed, roomEvents } = await startAgent(adapter, [ROOM_A]);
 
     await expect(agent.rooms.allow(ROOM_B, { warm: true })).resolves.toBe(true);
 
     expect(initialized).toBe(1);
     expect(roomEvents(ROOM_B)).toEqual(["room.ready", "room.joined"]);
+    expect(events.find((event) => event.type === "room.ready")).toEqual({
+      type: "room.ready",
+      roomId: ROOM_B,
+      agent: { protocol: "acp", protocolVersion: 1, agentInfo: { name: "fixture-acp", version: "1.2.3" } },
+    });
     expect(subscribed(ROOM_B)).toBe(true);
+  });
+
+  it("reports a warm ACP room whose agent names no implementation with agentInfo null", async () => {
+    const adapter = new ACPClientAdapter({
+      command: ["acp-fixture"],
+      cwd: tmpRoot(),
+      enableMcpTools: false,
+      connectionFactory: inMemoryAgent((): AcpAgent => ({
+        initialize: async () => ({ protocolVersion: 1, agentCapabilities: {} }),
+        authenticate: async () => ({}),
+        newSession: async () => ({ sessionId: "session-1" }),
+        cancel: async () => {},
+        prompt: async () => ({ stopReason: "end_turn" }),
+      })),
+    });
+    const { agent, events } = await startAgent(adapter, [ROOM_A]);
+
+    await agent.rooms.allow(ROOM_B, { warm: true });
+
+    expect(events.find((event) => event.type === "room.ready")).toMatchObject({
+      agent: { protocol: "acp", protocolVersion: 1, agentInfo: null },
+    });
+  });
+
+  it("reports room.ready with no agent identity for an adapter that starts nothing ahead", async () => {
+    const { adapter } = turnRecorder();
+    const { agent, events } = await startAgent(adapter, [ROOM_A]);
+
+    await agent.rooms.allow(ROOM_B, { warm: true });
+
+    expect(events.find((event) => event.type === "room.ready")).toEqual({ type: "room.ready", roomId: ROOM_B, agent: null });
   });
 });

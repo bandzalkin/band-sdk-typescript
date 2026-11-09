@@ -519,10 +519,10 @@ export class PlatformRuntime implements AsyncDisposable {
     return await runtime.presence.leaveRoom(roomId);
   }
 
-  /** Starts the room's agent; reports `room.ready`, or `room.failed` once whether or not the adapter did. */
+  /** Starts the room's agent; reports `room.ready` with what it said about itself, or `room.failed` once whether or not the adapter did. */
   private async warmRoom(adapter: FrameworkAdapter, roomId: string): Promise<void> {
     if (!adapter.warmRoom) {
-      this.events.emit({ type: "room.ready", roomId });
+      this.events.emit({ type: "room.ready", roomId, agent: null });
       return;
     }
     let reported = false;
@@ -530,8 +530,8 @@ export class PlatformRuntime implements AsyncDisposable {
       if (event.type === "room.failed" && event.roomId === roomId) reported = true;
     });
     try {
-      await adapter.warmRoom(roomId);
-      this.events.emit({ type: "room.ready", roomId });
+      const agent = await adapter.warmRoom(roomId);
+      this.events.emit({ type: "room.ready", roomId, agent });
     } catch (error) {
       if (!reported) {
         this.events.emit({ type: "room.failed", roomId, error: error instanceof Error ? error.message : String(error) });

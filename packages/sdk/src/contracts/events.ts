@@ -1,4 +1,14 @@
 /**
+ * What a room's agent process said about itself when it started: the
+ * protocol it speaks and the version negotiated, and for ACP the
+ * implementation its `initialize` response named, or `null` when it named
+ * none. A host can check from it which agent answered before using the room.
+ */
+export type RoomAgentIdentity =
+  | { protocol: "acp"; protocolVersion: number; agentInfo: { name: string; version: string } | null }
+  | { protocol: "omp-rpc"; protocolVersion: number };
+
+/**
  * What a running agent reports to the process hosting it through
  * `Agent.observe`. Local only: nothing here is posted to a room.
  */
@@ -40,8 +50,10 @@ export type AgentEvent =
   /**
    * A room allowed with `warm` has its agent process started, ahead of the
    * room's first message; reported before the room's messages are handled.
+   * `agent` is what that process said about itself, or `null` when the
+   * adapter starts nothing ahead of a message.
    */
-  | { type: "room.ready"; roomId: string }
+  | { type: "room.ready"; roomId: string; agent: RoomAgentIdentity | null }
   /** The room's agent process could not start; its messages fail until a later start succeeds. */
   | { type: "room.failed"; roomId: string; error: string }
   /** The room's message handling stopped: the room was left or reset, or the agent stopped. */

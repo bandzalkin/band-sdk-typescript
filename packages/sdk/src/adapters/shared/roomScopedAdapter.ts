@@ -1,5 +1,5 @@
 import type { HistoryConverter, MessagingTools, PlatformMessageLike } from "../../contracts/protocols";
-import type { AgentEventSink } from "../../contracts/events";
+import type { AgentEventSink, RoomAgentIdentity } from "../../contracts/events";
 import { resolveLogger, type Logger } from "../../core/logger";
 import { reportProviderTurnFailure } from "../../core/providerFailure";
 import { SimpleAdapter } from "../../core/simpleAdapter";
@@ -12,8 +12,8 @@ const ADAPTER_STOPPED_ERROR = "Adapter is stopped; start it again before sending
 export type RoomEngine<H, TTools> = SimpleAdapter<H, TTools> & {
   onRuntimeStop(): Promise<void>;
   isControlMessage?(message: PlatformMessageLike, roomId: string): boolean;
-  /** Starts the room's agent process now rather than on its first message. */
-  warm?(): Promise<void>;
+  /** Starts the room's agent process now rather than on its first message, resolving with what it said about itself. */
+  warm?(): Promise<RoomAgentIdentity>;
 };
 
 export interface RoomScopedAdapterOptions<H> extends RoomWorkspaceOptions {
@@ -88,11 +88,12 @@ export abstract class RoomScopedAdapter<H, TTools extends MessagingTools, E exte
 
   /**
    * Builds and starts the room's engine now, rather than on the room's first
-   * message; a failure is reported as `room.failed`, as it would be then.
+   * message, and resolves with what its agent said about itself; a failure is
+   * reported as `room.failed`, as it would be then.
    */
-  public async warmRoom(roomId: string): Promise<void> {
+  public async warmRoom(roomId: string): Promise<RoomAgentIdentity | null> {
     const engine = await this.engineFor(roomId);
-    await engine.warm?.();
+    return (await engine.warm?.()) ?? null;
   }
 
   /** The room's engine, or undefined while the room has none. */
