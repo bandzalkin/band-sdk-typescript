@@ -16,7 +16,6 @@ import {
   getToolDescription,
 } from "../contracts/toolSchemas";
 import { buildZodShape } from "./zod";
-import { TURN_ID_ARG } from "./turnContext";
 
 export interface McpToolRegistration {
   name: string;
@@ -50,8 +49,6 @@ export interface McpToolResult {
 export interface BuildRegistrationsOptions {
   /** @internal Wraps execution without changing tool schemas or results. */
   execute?: (work: () => Promise<McpToolResult>) => Promise<McpToolResult>;
-  /** @internal Resolve the issuing prompt's tools, refusing an obsolete capability. */
-  resolveTurnTools?: (turnId: string, roomId?: string) => AdapterToolsProtocol | undefined;
   enableMemoryTools?: boolean;
   enableTaskTools?: boolean;
   enableContactTools?: boolean;
@@ -136,7 +133,6 @@ export function buildRoomScopedRegistrations(
   resolver: ToolResolver,
   options: BuildRegistrationsOptions = {},
 ): McpToolRegistration[] {
-  if (options.resolveTurnTools) return buildTurnScopedRegistrations(options, true);
   const { roomlessTools } = options;
   const registrations = toolSchemas(resolveToolNames(options)).map((tool) =>
     roomlessTools && !ROOM_TOOL_NAMES.has(tool.name)
@@ -201,46 +197,12 @@ export function buildSingleContextRegistrations(
   tools: AdapterToolsProtocol,
   options: BuildRegistrationsOptions = {},
 ): McpToolRegistration[] {
-  if (options.resolveTurnTools) return buildTurnScopedRegistrations(options, false);
   const registrations = toolSchemas(resolveToolNames(options)).map((tool) => bindTool(tool, tools));
 
   if (options.additionalTools) {
     registrations.push(...options.additionalTools.map((tool) => ({ ...tool, execute: (args: Record<string, unknown>, context = tools) => tool.execute(args, context) })));
   }
 
-  return wrapExecution(registrations, options.execute);
-}
-
-/** All tools, including roomless host tools, must prove their issuing prompt. */
-function buildTurnScopedRegistrations(options: BuildRegistrationsOptions, multiRoom: boolean): McpToolRegistration[] {
-  const builtins = toolSchemas(resolveToolNames(options)).map((tool): McpToolRegistration => ({
-    ...tool,
-    execute: (args, tools) => executeToolCall(tools!, tool.name, args),
-  }));
-  const registrations = [...builtins, ...(options.additionalTools ?? [])].map((tool): McpToolRegistration => {
-    const builtin = builtins.includes(tool);
-    const roomScoped = multiRoom && (builtin || Object.hasOwn(tool.inputSchema.properties, ROOM_ID_ARG));
-    return {
-      ...tool,
-      inputSchema: {
-        type: "object",
-        properties: {
-          ...tool.inputSchema.properties,
-          ...(roomScoped ? { [ROOM_ID_ARG]: ROOM_ID_PROPERTY } : {}),
-          [TURN_ID_ARG]: { type: "string", description: "The Band tool turn ID supplied in this prompt. Copy it exactly." },
-        },
-        required: [...new Set([...tool.inputSchema.required, ...(roomScoped ? [ROOM_ID_ARG] : []), TURN_ID_ARG])],
-      },
-      execute: async ({ [TURN_ID_ARG]: turnId, ...args }) => {
-        const roomId = roomScoped ? asNonEmptyString(args[ROOM_ID_ARG]) ?? undefined : undefined;
-        if (roomScoped && !roomId) return errorResult(`Missing required ${ROOM_ID_ARG}`);
-        const tools = typeof turnId === "string" ? options.resolveTurnTools!(turnId, roomId) : undefined;
-        if (!tools) return errorResult("The tool call's turn is no longer current.");
-        if (roomScoped && builtin) delete args[ROOM_ID_ARG];
-        return tool.execute(args, tools);
-      },
-    };
-  });
   return wrapExecution(registrations, options.execute);
 }
 

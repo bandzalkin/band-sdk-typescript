@@ -88,8 +88,8 @@ that room's own activity reply (`working: false`), a processing/processed/failed
 write answered with HTTP 204, or a message/event post refused with HTTP 403 and
 `execution is stopped`. A transport error is not a Stop.
 
-Stop uses the adapter's `cancelTurn` hook, cancels pending approvals, and refuses
-late replies and terminal marks. The inbound stays unprocessed, including when its
+Stop uses the adapter's `cancelTurn` hook, cancels pending approvals, and revokes
+the stopped turn's runtime tools. The inbound stays unprocessed, including when its
 turn was handed back to wait for a decision. A Play push on `agent.control` runs
 `/messages/next` catch-up for its room, or all admitted rooms when no room id is
 given. A held turn defers that catch-up until it ends. If the push is missed, the
@@ -98,8 +98,8 @@ cancel turns. Withdrawing a room also stops its running turn without posting a
 provider failure.
 
 A post accepted just before Stop keeps its journaled receipt: retrying the same
-`operation_id` after Play does not post it again. The revoked turn cannot start
-another post or mark. Pending Cursor questions and plans are cancelled and their
+`operation_id` after Play does not post it again. A turn's revoked runtime tools
+cannot start another post or mark. Pending Cursor questions and plans are cancelled and their
 old tokens remain invalid after Play; OpenCode also rejects its pending asks.
 A held operation that rejects still finalizes once, as stopped during Stop or as
 a failed turn otherwise.
@@ -108,11 +108,16 @@ prompt response cannot restore a session that cancellation already abandoned.
 Cancelled OpenCode setup also ends quietly if the pending setup request later fails.
 Ask timeouts cannot post a notice through a newer turn.
 
-OpenCode and ACP Band MCP calls require the `band_turn_id` supplied in that
-prompt, including calls to custom tools. The server checks it before executing
-anything; an earlier prompt's ID cannot borrow the replay turn's tools. OpenCode
-calls still name their `room_id`. OMP host tools retain their originating turn
-across asynchronous work instead of resolving the room's latest tools.
+OMP host tools retain their originating turn across asynchronous work, including
+methods captured before cancellation. Codex server requests must match the active
+native thread and turn before they execute or are reported.
+
+**Known transport limit:** a late MCP call from an aborted OpenCode session or a
+cancelled prompt in a reused ACP session can still reach the room's current turn.
+Stop does not fence every late tool call. Fixing this requires transport-supplied
+identity, not a prompt argument. Follow-up options are a separate Band MCP endpoint
+per session with OpenCode per-prompt tool enablement, fresh ACP sessions after
+Stop, or a harness-supplied session identity.
 
 
 ### Observing an agent

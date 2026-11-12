@@ -1860,7 +1860,7 @@ describe("ACPClientAdapter", () => {
     }
   })
 
-  it("keeps room MCP credentials separate and refuses calls without a live prompt", async () => {
+  it("keeps MCP credentials and tool execution scoped to their room", async () => {
     const backends = new Map<string, { url: string; token: string }>()
     const tools = { "room-a": new FakeTools(), "room-b": new FakeTools() }
     const calls = {
@@ -1906,12 +1906,11 @@ describe("ACPClientAdapter", () => {
     try {
       // The model never names the room: no tool takes a room_id.
       const { tools: listed } = await client.listTools()
-      expect(listed.length).toBeGreaterThan(0)
       expect(listed.filter((tool) => "room_id" in (tool.inputSchema.properties ?? {}))).toEqual([])
 
       const result = await client.callTool({ name: "band_get_participants", arguments: {} })
-      expect(result.isError).toBe(true)
-      expect(calls["room-a"]).not.toHaveBeenCalled()
+      expect(result.isError).toBeUndefined()
+      expect(calls["room-a"]).toHaveBeenCalledWith("band_get_participants", {})
       expect(calls["room-b"]).not.toHaveBeenCalled()
     } finally {
       await transport.close()
@@ -5380,17 +5379,14 @@ function scriptedAgent(
           band = server && { url: server.url, authorization: server.headers[0]!.value }
           return { sessionId: "session-1" }
         },
-        prompt: async ({ sessionId, prompt }: { sessionId: string; prompt: Array<{ type: string; text?: string }> }) => {
+        prompt: async ({ sessionId }: { sessionId: string }) => {
           const update = async (next: SessionNotification["update"]) => {
             await acpClient!.sessionUpdate({ sessionId, update: next })
           }
           await script({
             update,
             say: (text) => update({ sessionUpdate: "agent_message_chunk", content: { type: "text", text } }),
-            callBand: (name, args) => callBandTool(band, name, {
-              band_turn_id: /Band tool turn: (\S+)/.exec(prompt.map((part) => part.text ?? "").join("\n"))?.[1],
-              ...args,
-            }),
+            callBand: (name, args) => callBandTool(band, name, args),
           })
           return { stopReason: "end_turn" }
         },

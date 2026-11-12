@@ -38,8 +38,6 @@ export interface McpResourceSource {
 }
 
 export interface BandMcpStdioServerOptions {
-  /** @internal */
-  resolveTurnTools?: BuildRegistrationsOptions["resolveTurnTools"];
   /** Without it, the server lists only `additionalTools`. */
   tools?: AdapterToolsProtocol | ((roomId: string) => AdapterToolsProtocol | undefined);
   name?: string;
@@ -65,7 +63,6 @@ export class BandMcpStdioServer {
     this.options = options;
 
     const regOptions: BuildRegistrationsOptions = {
-      resolveTurnTools: options.resolveTurnTools,
       enableMemoryTools: options.enableMemoryTools,
       enableTaskTools: options.enableTaskTools,
       enableContactTools: options.enableContactTools,

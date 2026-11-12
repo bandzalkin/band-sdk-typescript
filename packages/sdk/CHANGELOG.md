@@ -4,7 +4,7 @@
 
 ### Bug Fixes
 
-* **runtime:** honor room Stop and host withdrawal without late replies, failure posts or terminal marks; cancel approvals, preserve pending messages for replay after Play, and report the stopped cause to local observers.
+* **runtime:** honor room Stop and host withdrawal without failure posts or terminal marks; revoke stopped turns' runtime tools, cancel approvals, preserve pending messages for replay after Play, and report the stopped cause to local observers.
 * **runtime:** keep turns waiting for a decision unprocessed until they actually end.
 * **runtime:** resume pending messages on room- or execution-scoped Play pushes; a missed push waits for the next reconnect.
 * **runtime:** do not report a stopped turn completion when the turn was refused before it started.
@@ -13,8 +13,10 @@
 * **runtime:** finalize rejected held operations as stopped or failed instead of leaving the inbound and observer turn unfinished.
 * **adapters:** keep stopped OpenCode sessions abandoned when an old prompt is accepted late.
 * **adapters:** cancel OpenCode session setup without submitting a prompt after Stop.
-* **adapters:** refuse obsolete OpenCode and ACP tool calls after cancellation or Stop; asynchronous OMP host tools cannot write through a later turn.
+* **omp-rpc:** refuse asynchronous host tool actions after cancellation, including methods captured before the turn was cancelled.
 * **opencode:** drop stale ask-timeout notices and end cancelled setup quietly even if session creation later fails.
+* **codex:** refuse server requests for another native thread or turn before running or reporting tools.
+* **adapters:** restore ordinary Band MCP tool arguments. Late calls from abandoned OpenCode sessions or cancelled prompts in reused ACP sessions can still reach the current turn; transport-level binding remains follow-up work.
 
 
 ## [2.0.0](https://github.com/band-ai/band-sdk-typescript/compare/sdk-v1.0.0...sdk-v2.0.0) (2026-11-09)

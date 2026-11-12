@@ -26,8 +26,6 @@ export interface BandMcpBackend {
 export interface CreateBandMcpBackendOptions {
   /** @internal HTTP registration execution boundary. */
   execute?: BuildRegistrationsOptions["execute"];
-  /** @internal Bind adapter calls to the prompt that issued them. */
-  resolveTurnTools?: BuildRegistrationsOptions["resolveTurnTools"];
   kind: BandMcpBackendKind;
   enableMemoryTools: boolean;
   enableTaskTools?: boolean;
@@ -44,7 +42,6 @@ export async function createBandMcpBackend(
   options: CreateBandMcpBackendOptions,
 ): Promise<BandMcpBackend> {
   const registrationOptions = {
-    resolveTurnTools: options.resolveTurnTools,
     enableMemoryTools: options.enableMemoryTools,
     enableTaskTools: options.enableTaskTools,
     enableContactTools: true,
@@ -55,7 +52,6 @@ export async function createBandMcpBackend(
   if (options.kind === "sdk") {
     const { createBandSdkMcpServer } = await import("./sdk");
     const server = createBandSdkMcpServer({
-      resolveTurnTools: options.resolveTurnTools,
       getToolsForRoom: options.getToolsForRoom,
       multiRoom: options.multiRoom,
       enableMemoryTools: options.enableMemoryTools,
@@ -84,7 +80,6 @@ export async function createBandMcpBackend(
 
   if (options.kind === "stdio") {
     const server = new BandMcpStdioServer({
-      resolveTurnTools: options.resolveTurnTools,
       tools: resolvedTools,
       enableMemoryTools: options.enableMemoryTools,
       enableTaskTools: options.enableTaskTools,
@@ -109,7 +104,6 @@ export async function createBandMcpBackend(
 
   if (options.kind === "sse") {
     const server = new BandMcpSseServer({
-      resolveTurnTools: options.resolveTurnTools,
       tools: resolvedTools,
       enableMemoryTools: options.enableMemoryTools,
       enableTaskTools: options.enableTaskTools,
@@ -131,7 +125,6 @@ export async function createBandMcpBackend(
   }
 
   const server = new BandMcpServer({
-    resolveTurnTools: options.resolveTurnTools,
     execute: options.execute,
     tools: resolvedTools,
     enableMemoryTools: options.enableMemoryTools,

@@ -171,14 +171,13 @@ describe("room history in a turn", () => {
           return { sessionId: "session-1" };
         },
         cancel: async () => {},
-        prompt: async ({ sessionId, prompt }) => {
+        prompt: async ({ sessionId }) => {
           const transport = new StreamableHTTPClientTransport(new URL(access!.url), { requestInit: { headers: { authorization: access!.authorization } } });
           const band = new McpClient({ name: "history-agent", version: "1.0.0" });
           await band.connect(transport);
           try {
             listed = (await band.listTools()).tools.map((tool) => tool.name);
-            const turnId = /Band tool turn: (\S+)/.exec(prompt.filter((part) => part.type === "text").map((part) => part.text).join("\n"))?.[1];
-            const result = await band.callTool({ name: "read_room", arguments: { band_turn_id: turnId, limit: 5 } });
+            const result = await band.callTool({ name: "read_room", arguments: { limit: 5 } });
             const [block] = Array.isArray(result.content) ? result.content : [];
             readText = block?.type === "text" ? block.text : "";
           } finally {

@@ -1902,43 +1902,6 @@ describe("OpenCode platform Stop decisions", () => {
     } finally { establishment.release(); vi.useRealTimers(); }
   });
 
-  it("refuses an abandoned session's MCP calls while the replay turn can still post", async () => {
-    const custom = vi.fn((args: Record<string, unknown>) => args.source);
-    await using session = await opencodeRoom({}, {
-      customTools: [{ name: "record_turn", schema: z.object({ source: z.string() }), handler: custom }],
-    });
-    const { platform, room, server } = session;
-    let stopped = false;
-    platform.rest.reportActivity = async (_roomId, working) => ({ working: working && !stopped });
-    const messageId = await session.start(() => {});
-    const old = await server.turn(0);
-    stopped = true;
-    await platform.transport.emit(agentControlTopic(AGENT_ID), "agent.control", validateEventPayload("agent.control", {
-      type: "agent.control", mode: "stop", scope: "room", agent_id: AGENT_ID, execution_id: null,
-      room_id: room.id, reason: "user_requested", correlation_id: "stop-mcp-owner",
-    }) as Record<string, unknown>);
-    await server.until(() => server.requestsTo("POST", /\/abort$/).length === 1);
-    server.onPrompt(() => {});
-    stopped = false;
-    await platform.transport.emit(agentControlTopic(AGENT_ID), "agent.control", validateEventPayload("agent.control", {
-      type: "agent.control", mode: "play", scope: "room", agent_id: AGENT_ID, execution_id: null,
-      room_id: room.id, reason: "user_requested", correlation_id: "play-mcp-owner",
-    }) as Record<string, unknown>);
-    const replay = await server.turn(1);
-    const obsolete = await old.callTool(SEND_MESSAGE_TOOL_NAME, { ...ROOM, content: "obsolete native reply", mentions: ["@owner"] });
-    const obsoleteCustom = await old.callTool("record_turn", { ...ROOM, source: "obsolete" });
-    const current = await replay.callTool(SEND_MESSAGE_TOOL_NAME, { ...ROOM, content: "current native reply", mentions: ["@owner"] });
-    const currentCustom = await replay.callTool("record_turn", { ...ROOM, source: "current" });
-    replay.idle();
-    expect(await room.outcome(messageId)).toBe("processed");
-    expect(obsolete.isError).toBe(true);
-    expect(current.isError).toBeUndefined();
-    expect(obsoleteCustom.isError).toBe(true);
-    expect(currentCustom.isError).toBeUndefined();
-    expect(custom).toHaveBeenCalledTimes(1);
-    expect(room.messages.map((posted) => posted.content)).toEqual(["current native reply"]);
-  });
-
   it("drops an old ask timeout notice when its native reply finishes during replay", async () => {
     await using session = await opencodeRoom({ enableTaskEvents: false, approvalWaitTimeoutMs: 30, approvalTimeoutReply: "reject" });
     const { platform, room, server } = session;

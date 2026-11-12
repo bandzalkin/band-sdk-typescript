@@ -202,7 +202,7 @@ describe("OmpRpcAdapter", () => {
     expect(room.messages.map((posted) => posted.content)).toEqual(["Shipped @owner"]);
   });
 
-  it("keeps an asynchronous custom host tool bound to its cancelled turn", async () => {
+  it.each([false, true])("keeps an asynchronous custom host tool bound to its cancelled turn (captured method: %s)", async (captureMethod) => {
     const omp = fakeOmpProcesses();
     const entered = createDeferred();
     const release = createDeferred();
@@ -213,10 +213,11 @@ describe("OmpRpcAdapter", () => {
         description: "Reply after a held operation",
         inputSchema: { type: "object", properties: {}, required: [] },
         execute: async (_args, tools) => {
+          const send = captureMethod ? tools!.sendMessage : undefined;
           entered.resolve();
           await release.promise;
           try {
-            await tools!.sendMessage("obsolete custom reply", ["owner"]);
+            await (send ?? tools!.sendMessage)("obsolete custom reply", ["owner"]);
             return { content: [{ type: "text", text: "sent" }] };
           } finally { finished.resolve(); }
         },

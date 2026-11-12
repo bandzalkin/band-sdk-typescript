@@ -22,7 +22,12 @@ export function forwardTools<T extends object>(resolve: () => T, overrides: Part
       }
       const tools = resolve();
       const value: unknown = Reflect.get(tools, key, tools);
-      return typeof value === "function" ? (value.bind(tools) as unknown) : value;
+      if (typeof value !== "function") return value;
+      return (...args: unknown[]) => {
+        // Recheck the lease even when a caller captured this method earlier.
+        resolve();
+        return Reflect.apply(value, tools, args) as unknown;
+      };
     },
     // Without this, a write against the empty target would silently succeed
     // and vanish — invisible even to the handler that made it, since `get`

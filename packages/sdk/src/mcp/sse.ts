@@ -12,8 +12,6 @@ import { MCP_SERVER_NAME, MCP_SERVER_VERSION } from "../contracts/toolSchemas";
 import { isAuthorizedRequest } from "./auth";
 
 export interface BandMcpSseServerOptions {
-  /** @internal */
-  resolveTurnTools?: BuildRegistrationsOptions["resolveTurnTools"];
   tools: AdapterToolsProtocol | ((roomId: string) => AdapterToolsProtocol | undefined);
   name?: string;
   port?: number;
@@ -53,7 +51,6 @@ export class BandMcpSseServer {
     this.options = options
 
     const regOptions: BuildRegistrationsOptions = {
-      resolveTurnTools: options.resolveTurnTools,
       enableMemoryTools: options.enableMemoryTools,
       enableTaskTools: options.enableTaskTools,
       enableContactTools: options.enableContactTools,
