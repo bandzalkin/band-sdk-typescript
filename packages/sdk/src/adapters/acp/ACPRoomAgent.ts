@@ -53,6 +53,7 @@ import type { PlatformMessage } from "../../runtime/types";
 import type { McpToolRegistration } from "../../mcp/registrations";
 import { MCP_SERVER_NAME } from "../../contracts/toolSchemas";
 import { createBandMcpBackend, type BandMcpBackend } from "../../mcp/backends";
+import { TurnToolContext } from "../../mcp/turnContext";
 import { ACP_PERMISSION_METHOD, BandACPClient, type PromptActivity } from "./client";
 import {
   choosePermissionOption,
@@ -218,6 +219,7 @@ export interface ACPRoomAgentOptions extends Omit<ACPClientStdioOptions, "comman
 /** The turn holding a room; `prompt` is set while its ACP prompt is in flight. */
 interface ActiveTurn {
   cancelled: boolean
+  readonly toolContext: TurnToolContext
   // Settles when the host cancels, so a wait the turn is stuck in ends early.
   readonly cancellation: Deferred<void>
   prompt?: { connection: ClientSideConnection; sessionId: string; sessionKey: string }
@@ -392,7 +394,11 @@ export class ACPRoomAgent extends SimpleAdapter<ACPClientSessionState, TurnTools
     // they must stay this turn's until it ends.
     await this.roomTurns.run(context.roomId, async () => {
       this.roomTools.set(context.roomId, tools)
-      const turn: ActiveTurn = { cancelled: false, cancellation: createDeferred() }
+      const turn: ActiveTurn = {
+        cancelled: false,
+        cancellation: createDeferred(),
+        toolContext: new TurnToolContext(context.roomId, tools, () => this.activeTurns.get(context.roomId) === turn && !turn.cancelled),
+      }
       this.activeTurns.set(context.roomId, turn)
       try {
         await this.runTurn(message, tools, participantsMessage, contactsMessage, context, history, turn)
@@ -455,6 +461,7 @@ export class ACPRoomAgent extends SimpleAdapter<ACPClientSessionState, TurnTools
         const liveSections = replayLines ? framedReplay(replayLines, messageWithContext) : [messageWithContext]
         promptText = [this.buildSystemContext(context.roomId, message), ...liveSections].join("\n\n")
       }
+      if (this.enableMcpTools) promptText = [promptText, turn.toolContext.prompt].join("\n\n")
 
       if (turn.cancelled) {
         // Cancelled before its prompt was sent: there is nothing to tell the agent.
@@ -1477,6 +1484,7 @@ export class ACPRoomAgent extends SimpleAdapter<ACPClientSessionState, TurnTools
       kind: mcpTransport(initializeResult),
       enableMemoryTools: this.enableMemoryTools,
       enableTaskTools: this.enableTaskTools,
+      resolveTurnTools: (id) => this.activeTurns.get(this.roomId)?.toolContext.resolve(id),
       getToolsForRoom: () => this.roomTools.get(this.roomId),
       additionalTools: this.additionalMcpTools,
       multiRoom: false,

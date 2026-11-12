@@ -48,7 +48,7 @@ function buildMockConnection(spies: {
   agentCapabilities?: Record<string, unknown>;
   loadSession: () => Promise<Record<string, unknown>>;
   newSession: () => Promise<Record<string, unknown>>;
-  prompt: (params: { sessionId: string }) => Promise<{ stopReason: string }>;
+  prompt: (params: { sessionId: string; prompt: Array<{ type: string; text?: string }> }) => Promise<{ stopReason: string }>;
   extraRpcSpies?: Record<string, unknown>;
 }) {
   const controller = new AbortController()
@@ -1860,7 +1860,7 @@ describe("ACPClientAdapter", () => {
     }
   })
 
-  it("gives each room its own MCP backend and token, pinned to that room's tools", async () => {
+  it("keeps room MCP credentials separate and refuses calls without a live prompt", async () => {
     const backends = new Map<string, { url: string; token: string }>()
     const tools = { "room-a": new FakeTools(), "room-b": new FakeTools() }
     const calls = {
@@ -1910,8 +1910,8 @@ describe("ACPClientAdapter", () => {
       expect(listed.filter((tool) => "room_id" in (tool.inputSchema.properties ?? {}))).toEqual([])
 
       const result = await client.callTool({ name: "band_get_participants", arguments: {} })
-      expect(result.isError).toBeFalsy()
-      expect(calls["room-a"]).toHaveBeenCalledWith("band_get_participants", {})
+      expect(result.isError).toBe(true)
+      expect(calls["room-a"]).not.toHaveBeenCalled()
       expect(calls["room-b"]).not.toHaveBeenCalled()
     } finally {
       await transport.close()
@@ -1961,19 +1961,19 @@ describe("ACPClientAdapter", () => {
       return { adapter, backends, accessWhenStopped, exit: () => exit() }
     }
 
-    async function participants({ url, token }: BandAccess) {
+    async function listedTools({ url, token }: BandAccess) {
       const transport = new StreamableHTTPClientTransport(new URL(url), { requestInit: { headers: { authorization: token } } })
       const client = new McpClient({ name: "agent", version: "1.0.0" })
       await client.connect(transport)
       try {
-        return await client.callTool({ name: "band_get_participants", arguments: {} })
+        return await client.listTools()
       } finally {
         await transport.close()
       }
     }
 
     function bandAccess(access: BandAccess): Promise<"open" | "revoked"> {
-      return participants(access).then(() => "open", () => "revoked")
+      return listedTools(access).then(() => "open", () => "revoked")
     }
 
     function turn(adapter: ACPClientAdapter): Promise<void> {
@@ -1999,8 +1999,8 @@ describe("ACPClientAdapter", () => {
 
         const [retired, current] = backends
         expect(current!.token).not.toEqual(retired!.token)
-        await expect(participants(retired!)).rejects.toThrow()
-        expect((await participants(current!)).isError).toBeFalsy()
+        await expect(listedTools(retired!)).rejects.toThrow()
+        expect((await listedTools(current!)).tools.map((tool) => tool.name)).toContain("band_get_participants")
         await expect.poll(() => accessWhenStopped).toEqual(["revoked"])
       } finally {
         await adapter.stop()
@@ -5380,14 +5380,17 @@ function scriptedAgent(
           band = server && { url: server.url, authorization: server.headers[0]!.value }
           return { sessionId: "session-1" }
         },
-        prompt: async ({ sessionId }) => {
+        prompt: async ({ sessionId, prompt }: { sessionId: string; prompt: Array<{ type: string; text?: string }> }) => {
           const update = async (next: SessionNotification["update"]) => {
             await acpClient!.sessionUpdate({ sessionId, update: next })
           }
           await script({
             update,
             say: (text) => update({ sessionUpdate: "agent_message_chunk", content: { type: "text", text } }),
-            callBand: (name, args) => callBandTool(band, name, args),
+            callBand: (name, args) => callBandTool(band, name, {
+              band_turn_id: /Band tool turn: (\S+)/.exec(prompt.map((part) => part.text ?? "").join("\n"))?.[1],
+              ...args,
+            }),
           })
           return { stopReason: "end_turn" }
         },

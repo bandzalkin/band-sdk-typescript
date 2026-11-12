@@ -202,6 +202,47 @@ describe("OmpRpcAdapter", () => {
     expect(room.messages.map((posted) => posted.content)).toEqual(["Shipped @owner"]);
   });
 
+  it("keeps an asynchronous custom host tool bound to its cancelled turn", async () => {
+    const omp = fakeOmpProcesses();
+    const entered = createDeferred();
+    const release = createDeferred();
+    const finished = createDeferred();
+    const { agent, room } = await startAgent(ompAdapter(omp, {
+      additionalTools: [{
+        name: "delayed_reply",
+        description: "Reply after a held operation",
+        inputSchema: { type: "object", properties: {}, required: [] },
+        execute: async (_args, tools) => {
+          entered.resolve();
+          await release.promise;
+          try {
+            await tools!.sendMessage("obsolete custom reply", ["owner"]);
+            return { content: [{ type: "text", text: "sent" }] };
+          } finally { finished.resolve(); }
+        },
+      }],
+    }));
+    try {
+      const firstPrompt = omp.nextPrompt();
+      const first = await room.say("owner", "Start a slow tool");
+      const { peer, prompt } = await firstPrompt;
+      peer.send({ type: "host_tool_call", id: "slow-call", toolCallId: "slow-call", toolName: "delayed_reply", arguments: {} });
+      await entered.promise;
+      expect(await agent.cancelTurn(ROOM)).toBe(true);
+      peer.finish(prompt.id, "aborted");
+      expect(await room.outcome(first)).toBe("processed");
+      const nextPrompt = omp.nextPrompt();
+      const second = await room.say("owner", "Start the replacement");
+      const replay = await nextPrompt;
+      release.resolve();
+      await finished.promise;
+      await replay.peer.callHostTool("current-call", "band_send_message", { content: "current reply", mentions: ["owner"] });
+      replay.peer.finish(replay.prompt.id);
+      expect(await room.outcome(second)).toBe("processed");
+      expect(room.messages.map((posted) => posted.content)).toEqual(["current reply"]);
+    } finally { release.resolve(); }
+  });
+
   it("leaves the board and task tools out unless enabled", async () => {
     const omp = fakeOmpProcesses();
     const { agent } = await startAgent(ompAdapter(omp), (roomId) => roomId === ROOM);

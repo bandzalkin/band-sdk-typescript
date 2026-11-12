@@ -17,6 +17,7 @@ import {
   type BandMcpBackend,
 } from "../../mcp/backends";
 import type { McpToolRegistration } from "../../mcp/registrations";
+import { TurnToolContext } from "../../mcp/turnContext";
 import { MCP_SERVER_NAME } from "../../contracts/toolSchemas";
 import { abandon } from "../shared/abandon";
 import { senderAllowlist, type DecisionEntry, type DecisionRegistry, type Registration } from "../shared/decisions";
@@ -128,8 +129,10 @@ interface AskLifecycle<T> {
 class OpencodeTurn {
   /** The turn's native tool parts and the asks it waits on a human for, keyed by part and request id. */
   public readonly native: NativeActivity;
-  public constructor(public readonly tools: TurnTools) {
+  public readonly toolContext: TurnToolContext;
+  public constructor(public readonly tools: TurnTools, roomId: string, isCurrent: () => boolean) {
     this.native = trackNativeActivity(tools, new Set());
+    this.toolContext = new TurnToolContext(roomId, tools, isCurrent);
   }
   /** Prompt message id, so only OpenCode's reply messages parented to it are attributed to this turn. */
   public readonly messageId = opencodeMessageId();
@@ -191,7 +194,7 @@ interface Connection {
 interface RoomState {
   roomId: string;
   sessionId: string | null;
-  // The tools of the room's latest started turn; MCP calls resolve them, so a busy or control message must not replace them.
+  // The latest turn's tools, also used to relay its native decisions.
   tools: TurnTools;
   turn: OpencodeTurn | null;
   // Held while a message sets up its turn, across the awaits before it claims `turn`, so a second message waits as busy.
@@ -259,6 +262,7 @@ export class OpencodeAdapter extends SimpleAdapter<OpencodeSessionState, TurnToo
   private readonly logger: Logger;
   private readonly authorizedSenders: ReadonlySet<string> | null;
   private readonly rooms = new Map<string, RoomState>();
+  private readonly toolContexts = new Map<string, TurnToolContext>();
   private readonly roomBySession = new Map<string, string>();
   private connection: Connection | null = null;
   private systemPrompt = "";
@@ -364,6 +368,11 @@ export class OpencodeAdapter extends SimpleAdapter<OpencodeSessionState, TurnToo
       const { client, sessionId, needsHistoryReplay } = setup;
       await this.startTurn(roomState, tools, client, sessionId, message, participantsMessage, contactsMessage, history, needsHistoryReplay, context.roomId);
     } catch (error) {
+      if (starting.cancelled) {
+        this.abortAndAbandonSession(roomState);
+        tools.turn.settle();
+        return;
+      }
       rethrowIfRecoverableTurnFailure(error);
 
       this.logger.error("OpenCode adapter request failed", {
@@ -389,11 +398,11 @@ export class OpencodeAdapter extends SimpleAdapter<OpencodeSessionState, TurnToo
     needsHistoryReplay: boolean,
     roomId: string,
   ): Promise<void> {
-    // Bound together, with no await between: the room's MCP calls resolve to
-    // these tools, so they must be the tools of the turn `roomState.turn` holds.
-    const turn = new OpencodeTurn(tools);
+    // The capability and tools belong to this prompt, never its replacement.
+    const turn: OpencodeTurn = new OpencodeTurn(tools, roomId, () => roomState.turn === turn);
     roomState.turn = turn;
     roomState.tools = tools;
+    this.toolContexts.set(turn.toolContext.id, turn.toolContext);
     roomState.requesterMentions = [{ id: message.senderId }];
     try {
       await client.promptAsync(sessionId, {
@@ -401,7 +410,7 @@ export class OpencodeAdapter extends SimpleAdapter<OpencodeSessionState, TurnToo
         parts: this.buildPromptParts(message, participantsMessage, contactsMessage, {
           replayMessages: needsHistoryReplay ? history.replayMessages : null,
         }),
-        system: this.buildTurnSystem(roomId, message),
+        system: [this.buildTurnSystem(roomId, message), turn.toolContext.prompt].join("\n\n"),
         model: this.buildModelPayload(),
         agent: this.config.agent || undefined,
         variant: this.config.variant || undefined,
@@ -518,6 +527,10 @@ export class OpencodeAdapter extends SimpleAdapter<OpencodeSessionState, TurnToo
   private startMcpBackend(): Promise<BandMcpBackend | null> {
     return this.mcpBackendFactory({
       execute: suppressToolActivity,
+      resolveTurnTools: (id, roomId) => {
+        const context = this.toolContexts.get(id);
+        return context && (roomId === undefined || roomId === context.roomId) ? context.resolve(id) : undefined;
+      },
       kind: "http",
       enableMemoryTools: this.config.enableMemoryTools,
       getToolsForRoom: (roomId) => this.toolsForRoom(roomId),
@@ -840,10 +853,11 @@ export class OpencodeAdapter extends SimpleAdapter<OpencodeSessionState, TurnToo
       await this.replyInBackground(roomState, registry.tryClaim(entry.token)!, ask.autoReply);
       return;
     }
-    roomState.turn?.native.wait(entry.token);
+    const turn = roomState.turn;
+    turn?.native.wait(entry.token);
     registry.startTimeout(entry, ask.timeoutMs, async (expired) => {
-      if (await this.replyInBackground(roomState, expired, ask.timeoutReply)) {
-        await roomState.tools.sendEvent(ask.timedOutNotice, "error");
+      if (await this.replyInBackground(roomState, expired, ask.timeoutReply) && turn && roomState.turn === turn) {
+        await turn.tools.sendEvent(ask.timedOutNotice, "error");
       }
     });
     await this.postAsk(roomState, registry, entry, ask.prompt, ask.rejectAsk);
@@ -1184,6 +1198,7 @@ export class OpencodeAdapter extends SimpleAdapter<OpencodeSessionState, TurnToo
     if (roomState.turn !== turn) {
       return;
     }
+    if (turn) this.toolContexts.delete(turn.toolContext.id);
     this.dropDecisions(roomState, "turn_ended");
     // Settles a still-running `watchTurnCompletion` quietly; a no-op once it has settled.
     turn?.end("cancelled");

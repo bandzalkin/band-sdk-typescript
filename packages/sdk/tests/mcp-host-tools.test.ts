@@ -76,12 +76,13 @@ describe("a host's MCP tool gets the room's tools on every server", () => {
           return { sessionId: "session-1" };
         },
         cancel: async () => {},
-        prompt: async ({ sessionId }) => {
+        prompt: async ({ sessionId, prompt }) => {
           const transport = new StreamableHTTPClientTransport(new URL(access!.url), { requestInit: { headers: { authorization: access!.authorization } } });
           const band = new McpClient({ name: "acp-agent", version: "1.0.0" });
           await band.connect(transport);
           try {
-            result = await band.callTool({ name: "mark_room", arguments: { room_id: ROOM, marker: "acp" } });
+            const turnId = /Band tool turn: (\S+)/.exec(prompt.filter((part) => part.type === "text").map((part) => part.text).join("\n"))?.[1];
+            result = await band.callTool({ name: "mark_room", arguments: { band_turn_id: turnId, room_id: ROOM, marker: "acp" } });
           } finally {
             await transport.close();
           }

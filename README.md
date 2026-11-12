@@ -105,6 +105,14 @@ A held operation that rejects still finalizes once, as stopped during Stop or as
 a failed turn otherwise.
 If Stop arrives during OpenCode setup, that turn never submits its prompt. A late
 prompt response cannot restore a session that cancellation already abandoned.
+Cancelled OpenCode setup also ends quietly if the pending setup request later fails.
+Ask timeouts cannot post a notice through a newer turn.
+
+OpenCode and ACP Band MCP calls require the `band_turn_id` supplied in that
+prompt, including calls to custom tools. The server checks it before executing
+anything; an earlier prompt's ID cannot borrow the replay turn's tools. OpenCode
+calls still name their `room_id`. OMP host tools retain their originating turn
+across asynchronous work instead of resolving the room's latest tools.
 
 
 ### Observing an agent

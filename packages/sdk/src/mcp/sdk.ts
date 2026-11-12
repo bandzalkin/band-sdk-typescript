@@ -7,10 +7,13 @@ import {
   buildSingleContextRegistrations,
   resolveSingleRoomTools,
   type McpToolRegistration,
+  type BuildRegistrationsOptions,
 } from "./registrations";
 import { createSdkMcpBridge } from "./sdkTools";
 
 export interface CreateBandSdkMcpServerOptions {
+  /** @internal */
+  resolveTurnTools?: BuildRegistrationsOptions["resolveTurnTools"];
   enableMemoryTools: boolean;
   enableTaskTools?: boolean;
   /**
@@ -63,6 +66,7 @@ export function createBandSdkMcpServer(
   options: CreateBandSdkMcpServerOptions,
 ): BandSdkMcpServer {
   const registrationOptions = {
+    resolveTurnTools: options.resolveTurnTools,
     enableMemoryTools: options.enableMemoryTools,
     enableTaskTools: options.enableTaskTools,
     enableContactTools: true,

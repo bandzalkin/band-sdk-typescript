@@ -84,7 +84,10 @@ export class OpencodeTurn {
 
   /** Calls one of the MCP tools the adapter registered, as OpenCode's model would. */
   public async callTool(name: string, args: Record<string, unknown>): Promise<{ isError?: boolean; text: string }> {
-    const result = await (await this.server.mcpClient()).callTool({ name, arguments: args });
+    const turnId = /Band tool turn: (\S+)/.exec(String(this.prompt.system))?.[1];
+    const result = await (await this.server.mcpClient()).callTool({
+      name, arguments: { ...(turnId ? { band_turn_id: turnId } : {}), ...args },
+    });
     const content = (result.content as Array<{ type: string; text?: string }> | undefined) ?? [];
     return { isError: result.isError === true ? true : undefined, text: content.map((part) => part.text ?? "").join("") };
   }

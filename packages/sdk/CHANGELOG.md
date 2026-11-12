@@ -13,6 +13,8 @@
 * **runtime:** finalize rejected held operations as stopped or failed instead of leaving the inbound and observer turn unfinished.
 * **adapters:** keep stopped OpenCode sessions abandoned when an old prompt is accepted late.
 * **adapters:** cancel OpenCode session setup without submitting a prompt after Stop.
+* **adapters:** refuse obsolete OpenCode and ACP tool calls after cancellation or Stop; asynchronous OMP host tools cannot write through a later turn.
+* **opencode:** drop stale ask-timeout notices and end cancelled setup quietly even if session creation later fails.
 
 
 ## [2.0.0](https://github.com/band-ai/band-sdk-typescript/compare/sdk-v1.0.0...sdk-v2.0.0) (2026-11-09)

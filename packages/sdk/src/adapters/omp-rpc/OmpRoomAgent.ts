@@ -8,6 +8,7 @@ import { REDACTED_VALUE, SENSITIVE_KEY_TERMS, redactCredentialText } from "../..
 import { SimpleAdapter } from "../../core/simpleAdapter";
 import { relayReply, type TurnTools } from "../../core/turn";
 import { buildSingleContextRegistrations, resolveSingleRoomTools, type McpToolRegistration } from "../../mcp/registrations";
+import { forwardTools } from "../../core/overrideTools";
 import { renderSystemPrompt } from "../../runtime/prompts";
 import type { PlatformMessage } from "../../runtime/types";
 import { trackNativeActivity } from "../../runtime/workingState";
@@ -593,7 +594,13 @@ export class OmpRoomAgent extends SimpleAdapter<OmpRpcSessionState, TurnTools> {
     if (!registration) {
       return { content: [{ type: "text", text: "Tool is not available in this session" }], isError: true };
     }
-    const result = await registration.execute(call.arguments);
+    // A custom tool can await across cancellation. Its later accesses must
+    // never resolve against a replacement turn's tools.
+    const tools = forwardTools(() => {
+      if (turn.cancelled || this.activeTurn !== turn) throw new OmpTurnCancelledError();
+      return turn.tools;
+    });
+    const result = await registration.execute(call.arguments, tools);
     return { content: result.content, ...(result.isError ? { isError: true } : {}) };
   }
 
