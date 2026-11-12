@@ -205,10 +205,9 @@ export function missingReplyFailure(): AgentFailure {
 }
 
 /**
- * Judges a detached turn at its real end, reporting a missing reply. Its
- * delivery was already acked, so this only tells the room. A turn that isn't
- * detached is left alone: `SimpleAdapter.onEvent` judges it, and a report here
- * would mark it reported first. An unjudged turn is never reported.
+ * Judges a detached turn at its real end, reporting a missing reply. A turn
+ * that isn't detached is left alone: `SimpleAdapter.onEvent` judges it, and
+ * a report here would mark it reported first. An unjudged turn is never reported.
  */
 export async function reportUnsettledTurn(
   tools: TurnTools<MessagingTools>,

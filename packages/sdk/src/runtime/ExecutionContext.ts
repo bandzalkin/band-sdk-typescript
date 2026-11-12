@@ -6,6 +6,7 @@ import type { AdapterToolsProtocol, AgentToolsCapabilities } from "../contracts/
 import type { MetadataMap, ParticipantRecord } from "../contracts/dtos";
 import { UnsupportedFeatureError } from "../core/errors";
 import { resolveLogger, type Logger } from "../core/logger";
+import { RoomTurnControl } from "../core/roomTurn";
 import { parseSessionConfig, type ConversationContext, type PlatformMessage, type SessionConfig, type ResolvedSessionConfig } from "./types";
 import { AgentTools } from "./tools/AgentTools";
 import { ParticipantRoster, RetryTracker } from "@band-ai/band-sdk-core";
@@ -38,6 +39,7 @@ const DEDUP_CACHE_MAX = 500;
 export class ExecutionContext {
   public readonly roomId: string;
   public readonly link: ExecutionContextLink;
+  public readonly turnControl: RoomTurnControl;
   private readonly maxContextMessages: number;
   private readonly logger: Logger;
   private readonly enableContextCache: boolean;
@@ -69,6 +71,7 @@ export class ExecutionContext {
     this.link = options.link;
     this.maxContextMessages = sessionConfig.maxContextMessages;
     this.logger = resolveLogger(options.logger);
+    this.turnControl = new RoomTurnControl(this.roomId, this.logger);
     this.enableContextCache = sessionConfig.enableContextCache;
     this.contextCacheTtlMs = sessionConfig.contextCacheTtlSeconds * 1000;
     this.enableContextHydration = sessionConfig.enableContextHydration;
@@ -128,13 +131,14 @@ export class ExecutionContext {
     return this.adapterTools;
   }
 
-  public openWorkingCycle(report: ReportFn): WorkingLease | undefined {
+  public openWorkingCycle(report: ReportFn, onStopped?: () => void): WorkingLease | undefined {
     if (!this.sessionConfig.enableWorkingState) return undefined;
     this.workingReporter ??= new WorkingStateReporter(report, this.sessionConfig, this.roomId, this.logger);
-    return this.workingReporter.open();
+    return this.workingReporter.open(onStopped);
   }
 
   public async closeWorkingState(): Promise<void> {
+    this.turnControl.stop("withdrawal");
     await this.workingReporter?.close();
   }
 
@@ -161,6 +165,18 @@ export class ExecutionContext {
       }
       this.contextCache.hydratedAt = new Date();
       this.contextCacheExpiresAt = this.nextCacheExpiry();
+    }
+  }
+
+  /** A stopped inbound is still pending on Band; let its next delivery enter preprocessing again. */
+  public releaseMessage(messageId: string): void {
+    this.dedupCache.delete(messageId);
+    this.messageIds.delete(messageId);
+    const index = this.history.findIndex((message) => message.id === messageId);
+    if (index >= 0) this.history.splice(index, 1);
+    if (this.contextCache) {
+      const cached = this.contextCache.messages.findIndex((message) => message.id === messageId);
+      if (cached >= 0) this.contextCache.messages.splice(cached, 1);
     }
   }
 

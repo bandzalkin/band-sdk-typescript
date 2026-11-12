@@ -391,7 +391,7 @@ describe("OpenCode in a Band room", () => {
     });
     try {
       await room.nextMessage((posted) => posted.content === approvalPrompt("per_working"));
-      await room.outcome(message);
+      expect(room.outcomes(message)).toEqual([]);
       expect(reports.entries.at(-1)?.activity).toEqual({ kind: "permission" });
       await vi.advanceTimersByTimeAsync(6000);
       // Initial reasoning, permission change, then two refreshes.
@@ -725,7 +725,8 @@ describe("OpenCode in a Band room", () => {
     const hungAbort = server.hold("POST /session/ses_:id/abort");
     const stuck = await session.start((turn) => void turn.askPermission({ id: "per_stuck" }));
     // The room gets its queue back once OpenCode asks, and by then the turn's watchdog is running.
-    expect(await room.outcome(stuck)).toBe("processed");
+    await room.nextMessage((posted) => posted.content === approvalPrompt("per_stuck"));
+    expect(room.outcomes(stuck)).toEqual([]);
 
     await vi.advanceTimersByTimeAsync(TURN_TIMEOUT_MS);
     await hungAbort.sending;
@@ -1218,7 +1219,7 @@ describe("OpenCode in a Band room", () => {
     const permission = "per_dropped";
     const message = await session.start((turn) => void turn.askPermission({ id: permission }));
     await room.nextMessage((posted) => posted.content === approvalPrompt(permission));
-    expect(await room.outcome(message)).toBe("processed");
+    expect(room.outcomes(message)).toEqual([]);
 
     await room.remove();
     await server.until(() => server.mcpDeregistrations().length === 1);
@@ -1396,10 +1397,11 @@ describe("OpenCode in a Band room", () => {
       }
       await ended.promise;
       await room.until(() => room.failures.length > 0);
+      await room.outcome(message);
 
       expect(server.questionReplies()).toEqual([[question, DECLINED]]);
       expect(room.failures).toEqual([MISSING_REPLY]);
-      expect(room.outcomes(message), "the request was already handed back").toEqual(["processed"]);
+      expect(room.outcomes(message)).toEqual(["processed"]);
     });
 
     it.each([
@@ -1415,7 +1417,8 @@ describe("OpenCode in a Band room", () => {
         await finish(turn);
         ended.resolve();
       });
-      expect(await room.outcome(message)).toBe("processed");
+      await room.nextMessage((entry) => entry.content === approvalPrompt(permission));
+      expect(room.outcomes(message)).toEqual([]);
 
       expect(await room.exchange(OWNER, `approve ${permission}`)).toEqual([SAYS.approvalHandled(permission, "once")]);
       await ended.promise;
@@ -1424,7 +1427,7 @@ describe("OpenCode in a Band room", () => {
       // The approval prompt was only a notice, so the answer after it is still relayed.
       expect(room.messages.map((entry) => entry.content)).toEqual([approvalPrompt(permission), SAYS.approvalHandled(permission, "once"), ...posted, DONE]);
       expect(room.failures).toEqual(failures);
-      expect(room.outcomes(message), "the request was already handed back").toEqual(["processed"]);
+      expect(room.outcomes(message)).toEqual(["processed"]);
     });
 
     it("passes a control past a held message during a handed-back turn, and keeps that turn's own reply on it", async () => {
@@ -1508,7 +1511,9 @@ describe("OpenCode holds the room's other work until a handed-back turn ends", (
       approvalPrompt(permission), SAYS.approvalHandled(permission, "once"), DONE, "First answer.", "Second answer.",
     ]);
     const processed = platform.rest.settled.entries.filter((entry) => entry.outcome === "processed").map((entry) => entry.messageId);
-    expect(processed).toEqual([asked, approval, first, second]);
+    expect(processed.filter((id) => id !== asked && id !== approval)).toEqual([first, second]);
+    expect(room.outcomes(asked)).toEqual(["processed"]);
+    expect(room.outcomes(approval)).toEqual(["processed"]);
     const prompts = server.requestsTo("POST", /\/prompt_async$/).map((request) => JSON.stringify(request.body));
     expect(prompts[1]).toContain("First question");
     expect(prompts[2]).toContain("Second question");
@@ -1519,7 +1524,8 @@ describe("OpenCode holds the room's other work until a handed-back turn ends", (
     await using session = await opencodeRoom({ turnTimeoutMs: TURN_TIMEOUT_MS, approvalWaitTimeoutMs: TURN_TIMEOUT_MS * 2 });
     const { room, server } = session;
     const stuck = await session.start((turn) => void turn.askPermission({ id: "per_stuck" }));
-    expect(await room.outcome(stuck)).toBe("processed");
+    await room.nextMessage((posted) => posted.content === approvalPrompt("per_stuck"));
+    expect(room.outcomes(stuck)).toEqual([]);
     server.onPrompt((turn) => turn.answer("Back to work."));
 
     const waiting = await room.say(OWNER, "Still there?");
@@ -1529,11 +1535,11 @@ describe("OpenCode holds the room's other work until a handed-back turn ends", (
     expect(room.messages.at(-1)?.content).toBe("Back to work.");
   });
 
-  it("stops during a handed-back turn without marking the message that waited, so Band serves it again", async () => {
+  it("leaves both the stopped handed-back turn and its queued message unmarked for replay", async () => {
     await using session = await opencodeRoom();
     const { room, platform } = session;
     const [first, second] = ["per_stop_1", "per_stop_2"];
-    await session.start(async (turn) => {
+    const active = await session.start(async (turn) => {
       await turn.askPermission({ id: first }).reply;
       await turn.askPermission({ id: second }).reply;
       turn.answer(DONE);
@@ -1547,7 +1553,8 @@ describe("OpenCode holds the room's other work until a handed-back turn ends", (
     await platform[Symbol.asyncDispose]();
 
     expect(room.outcomes(waiting)).toEqual([]);
-    expect((await platform.rest.getNextMessage({ chatId: room.id }))?.id).toBe(waiting);
+    expect(room.outcomes(active)).toEqual([]);
+    expect((await platform.rest.getNextMessage({ chatId: room.id }))?.id).toBe(active);
   });
 
   it("leaves an approval the socket missed waiting until the ask expires, then tells its sender the ask is gone", async () => {
@@ -1656,9 +1663,11 @@ describe("OpenCode holds the room's other work until a handed-back turn ends", (
     await using session = await opencodeRoom();
     const { room, server, platform } = session;
     const permission = "per_once";
-    expect(await room.outcome(await session.start(approvedThenDone(permission)))).toBe("processed");
+    const message = await session.start(approvedThenDone(permission));
+    await room.nextMessage((posted) => posted.content === approvalPrompt(permission));
+    expect(room.outcomes(message)).toEqual([]);
     platform.transport.triggerRejoin(chatRoomTopic(room.id));
-    const refusedMark = room.holdNextProcessed({ error: new Error("processed mark refused") });
+    const refusedMark = platform.rest.processedHolds.hold((id) => id !== message, { error: new Error("processed mark refused") });
 
     const said = room.say(OWNER, `approve ${permission}`);
     const [refusedId] = await refusedMark.sending;

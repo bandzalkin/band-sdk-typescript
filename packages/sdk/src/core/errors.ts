@@ -38,15 +38,22 @@ export class RuntimeStateError extends BandSdkError {
  * loop — and every other room — running for these, where any other error
  * stops the whole runtime.
  *
- * The turn still fails: `PlatformRuntime` has already marked the message
- * failed by the time one of these reaches the queue. What it must not do is
- * take the agent down with it, which is the right response to a broken
- * adapter and the wrong one to a single reply that could not be posted.
+ * A failed turn is marked failed before this reaches the queue. A stopped
+ * turn instead remains unprocessed for replay. Neither should take the room
+ * down: a broken adapter does, a refused reply or withdrawn turn does not.
  */
 export class RecoverableTurnError extends BandSdkError {
   public constructor(message: string, cause?: unknown) {
     super(message, cause);
     this.name = "RecoverableTurnError";
+  }
+}
+
+/** The room refused execution, or the host withdrew its running turn. Not a provider failure. */
+export class RoomExecutionStoppedError extends RecoverableTurnError {
+  public constructor(public readonly roomId: string) {
+    super("Room execution is stopped");
+    this.name = "RoomExecutionStoppedError";
   }
 }
 

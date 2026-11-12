@@ -13,7 +13,7 @@ import {
 } from "./types";
 import type { PlatformMessage } from "./types";
 import type { ParticipantRecord, MetadataMap } from "../contracts/dtos";
-import { RuntimeStateError, ValidationError } from "../core/errors";
+import { RecoverableTurnError, RoomExecutionStoppedError, RuntimeStateError, ValidationError } from "../core/errors";
 import { DefaultPreprocessor, toPlatformMessage } from "./preprocessing/DefaultPreprocessor";
 import { ContactEventHandler } from "./ContactEventHandler";
 import type { ExecutionContext, ExecutionContextOptions } from "./ExecutionContext";
@@ -599,70 +599,93 @@ export class PlatformRuntime implements AsyncDisposable {
     const roomId = input.roomId;
     const isSynthetic = isSyntheticTurn(input.message);
     const messageMarkOptions = { bestEffort: true } as const;
-    const journal = messageId && !isSynthetic ? await this.journal?.room(roomId) : undefined;
-    if (journal && (await this.settleJournaledInbound(journal, roomId, messageId, messageMarkOptions))) {
-      return;
-    }
-
-    if (messageId && !isSynthetic) {
-      await this.link.markProcessing(roomId, messageId, messageMarkOptions);
-    }
-
-    if (!admitted()) return;
-    const lease = roomId === this.contactHubRoomId ? undefined : context.openWorkingCycle(
-      (working, options) => this.link.reportActivity(roomId, working, options),
-    );
-
-    // History ids, not content: enough to tell what a cold-boot turn could recall.
-    this.logger.debug("turn starting", {
-      roomId,
-      messageId,
-      isSessionBootstrap: input.isSessionBootstrap,
-      historyMessageIds: input.history.raw.map((entry) => entry.id),
-    });
-    const startedAt = Date.now();
-    let succeeded = true;
-    let caughtError: unknown;
-    let started = false;
-    try {
-      await lease?.ready;
-      if (!admitted()) return;
-      this.events.emit({ type: "turn.started", roomId, messageId });
-      started = true;
-      const pinned = pinTurnInbound(input.tools, input.message);
-      const cycled = lease ? bindWorkingCycle(pinned, lease) : pinned;
-      // Outermost, so every reply path, the scoped tool executor's included, is journaled.
-      const tools = journal ? journalingTools(cycled, journal, messageId) : cycled;
-      await adapter.onEvent({ ...input, tools, holdRoomUntil });
-    } catch (error) {
-      succeeded = false;
-      caughtError = error;
-    } finally {
-      await lease?.end();
-    }
-    if (started) {
-      this.events.emit(succeeded
-        ? { type: "turn.completed", roomId, messageId }
-        : { type: "turn.failed", roomId, messageId, error: caughtError instanceof Error ? caughtError.message : String(caughtError) });
-    }
-    if (!admitted()) return;
-    this.logger.debug("turn finished", { roomId, messageId, succeeded, durationMs: Date.now() - startedAt });
-
-    if (messageId && !isSynthetic) {
-      const decision = evaluateAdapterResult(roomId, messageId, succeeded);
-      if (decision.decision === "processed") {
-        // Recorded first, so a restart before the mark below does not answer it again.
-        await journal?.turnDone(messageId);
-        await this.link.markProcessed(roomId, messageId, messageMarkOptions);
-      } else {
-        const label = caughtError instanceof Error ? caughtError.message : String(caughtError);
-        await this.link.markFailed(roomId, messageId, label, messageMarkOptions);
+    const turn = context.turnControl.open(async () => await adapter.cancelTurn?.(roomId));
+    await turn.run(async () => {
+      let started = false;
+      let succeeded = true;
+      let caughtError: unknown;
+      let held: Promise<void> | undefined;
+      let lease: ReturnType<ExecutionContext["openWorkingCycle"]>;
+      const startedAt = Date.now();
+      const finish = async (): Promise<void> => {
+        try {
+          await lease?.end();
+          if (!turn.stopCause) {
+            turn.assertCurrent();
+            if (messageId && !isSynthetic) {
+              const decision = evaluateAdapterResult(roomId, messageId, succeeded);
+              if (decision.decision === "processed") {
+                await journal?.turnDone(messageId);
+                await this.link.markProcessed(roomId, messageId, messageMarkOptions);
+              } else {
+                const label = caughtError instanceof Error ? caughtError.message : String(caughtError);
+                await this.link.markFailed(roomId, messageId, label, messageMarkOptions);
+              }
+            }
+          }
+        } catch (error) {
+          succeeded = false;
+          caughtError = error;
+        } finally {
+          await turn.close();
+          if (turn.stopCause) {
+            context.releaseMessage(messageId);
+            this.events.emit({ type: "turn.completed", roomId, messageId, outcome: "stopped", cause: turn.stopCause });
+          } else if (started) {
+            this.events.emit(succeeded
+              ? { type: "turn.completed", roomId, messageId }
+              : { type: "turn.failed", roomId, messageId, error: caughtError instanceof Error ? caughtError.message : String(caughtError) });
+          }
+        }
+        this.logger.debug("turn finished", { roomId, messageId, succeeded, durationMs: Date.now() - startedAt });
+        if (turn.stopCause) throw new RoomExecutionStoppedError(roomId);
+        if (!succeeded) throw caughtError;
+      };
+      let journal: RoomJournal | undefined;
+      try {
+        journal = messageId && !isSynthetic ? await this.journal?.room(roomId) : undefined;
+        if (journal && (await this.settleJournaledInbound(journal, roomId, messageId, messageMarkOptions))) {
+          await turn.close();
+          return;
+        }
+        if (messageId && !isSynthetic) await this.link.markProcessing(roomId, messageId, messageMarkOptions);
+        turn.assertCurrent();
+        lease = roomId === this.contactHubRoomId ? undefined : context.openWorkingCycle(
+          (working, options) => this.link.reportActivity(roomId, working, options),
+          () => turn.observeStop(),
+        );
+        await lease?.ready;
+        turn.assertCurrent();
+        this.logger.debug("turn starting", {
+          roomId, messageId, isSessionBootstrap: input.isSessionBootstrap,
+          historyMessageIds: input.history.raw.map((entry) => entry.id),
+        });
+        this.events.emit({ type: "turn.started", roomId, messageId });
+        started = true;
+        const pinned = pinTurnInbound(input.tools, input.message);
+        const cycled = lease ? bindWorkingCycle(pinned, lease) : pinned;
+        const journaled = journal ? journalingTools(cycled, journal, messageId) : cycled;
+        await adapter.onEvent({
+          ...input,
+          tools: turn.bind(journaled),
+          holdRoomUntil: (ended) => { held = ended; },
+        });
+      } catch (error) {
+        succeeded = false;
+        caughtError = error;
       }
-    }
-
-    if (!succeeded) {
-      throw caughtError;
-    }
+      if (held) {
+        // A decision wait releases the queue, not the turn's write authority or terminal mark.
+        holdRoomUntil(held.then(finish).catch((error: unknown) => {
+          if (error instanceof RoomExecutionStoppedError) throw error;
+          if (!(error instanceof RecoverableTurnError)) {
+            this.logger.error("Held turn settlement failed", { roomId, messageId, error });
+          }
+        }));
+      } else {
+        await finish();
+      }
+    });
   }
 
   /**

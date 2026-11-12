@@ -16,7 +16,9 @@ export type AgentEvent =
   /** A turn for `messageId` reached the adapter. */
   | { type: "turn.started"; roomId: string; messageId: string }
   /** The adapter finished the turn without throwing. */
-  | { type: "turn.completed"; roomId: string; messageId: string }
+  | { type: "turn.completed"; roomId: string; messageId: string; outcome?: never; cause?: never }
+  /** The room refused execution or the host withdrew it; the inbound remains unprocessed. */
+  | { type: "turn.completed"; roomId: string; messageId: string; outcome: "stopped"; cause: "platform" | "withdrawal" }
   /** The adapter threw; `error` is its message. */
   | { type: "turn.failed"; roomId: string; messageId: string; error: string }
   /** Reasoning text as the agent streams it; consecutive events continue one run. */

@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+### Bug Fixes
+
+* **runtime:** honor room Stop and host withdrawal without late replies, failure posts or terminal marks; cancel approvals, preserve pending messages for replay after Play, and report the stopped cause to local observers.
+* **runtime:** keep turns waiting for a decision unprocessed until they actually end.
+
 
 ## [2.0.0](https://github.com/band-ai/band-sdk-typescript/compare/sdk-v1.0.0...sdk-v2.0.0) (2026-11-09)
 

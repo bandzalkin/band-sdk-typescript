@@ -81,6 +81,20 @@ The coding-agent adapters (`CopilotACPAdapter`, `CursorACPAdapter`, `KiroACPAdap
   - `deny` leaves an admitted room: it unsubscribes the room's topic and stops its process, so the room's messages stop arriving, and the room is not admitted again, even when Band adds the agent back, until it is allowed. It resolves `true` when an admitted room was left.
 - **Upgrading.** TCP transports (`host`/`port`) were removed. Sessions created in the old shared `cwd` usually fail to restore once, so each existing room replays its history into a fresh session.
 
+### Room Stop
+
+The platform's Stop is separate from `agent.cancelTurn`. The runtime learns it from
+that room's own activity reply (`working: false`), a processing/processed/failed
+write answered with HTTP 204, or a message/event post refused with HTTP 403 and
+`execution is stopped`. A transport error is not a Stop.
+
+Stop uses the adapter's `cancelTurn` hook, cancels pending approvals, and refuses
+late replies and terminal marks. The inbound stays unprocessed, including when its
+turn was handed back to wait for a decision. After Play, normal `/messages/next`
+catch-up replays it; no host resume call is required. Withdrawing a room also stops
+its running turn without posting a provider failure.
+
+
 ### Observing an agent
 
 A process that hosts an agent can follow it locally with `agent.observe(listener)`, which returns a function that removes the listener. Nothing a listener receives is posted to a room, and observing does not change what the room sees.
@@ -92,6 +106,11 @@ const stop = agent.observe((event) => {
 ```
 
 Every adapter reports `turn.started`, `turn.completed` and `turn.failed`, `room.joined`, `room.left` and `room.stopped`, `room.ready` (and, for an adapter whose room process cannot start, `room.failed`) for a room allowed with `warm`, and `link.connected` and `link.disconnected` (`dropped` while the socket retries on its own, `closed` on a local disconnect, `terminal` when it ended for good). `ACPClientAdapter` and its subclasses, and `OmpRpcAdapter`, also report what their agent streams as it arrives: `thought` and `message` text, `tool.call` and `tool.result`, `approval.requested` and `approval.resolved`, and `room.failed` when the room's agent process cannot start or exits on its own. Each tool call is reported once, when its arguments arrive (or just before its result, for a call that has none), and named by the agent's own tool name when its ACP bridge reports one, else by its ACP `kind` — never by its display title, which can hold a whole command line. Arguments and results are passed through as the agent sent them, so redact them before logging. Listeners run synchronously in event order, so keep them quick; one that throws or rejects is logged and skipped without failing the turn or the other listeners.
+
+A stopped turn reports `turn.completed` with `outcome: "stopped"` and
+`cause: "platform"` or `"withdrawal"`, not `turn.failed`. Ordinary
+`turn.completed` events retain their existing shape.
+
 
 ### Reading a room's history
 

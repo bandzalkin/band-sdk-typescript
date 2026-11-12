@@ -1,6 +1,6 @@
 import type { MentionInput, ToolOperationResult } from "../contracts/dtos";
 import type { MessagingTools } from "../contracts/protocols";
-import { RecoverableTurnError } from "./errors";
+import { RecoverableTurnError, RoomExecutionStoppedError } from "./errors";
 import { asErrorMessage } from "./coercion";
 
 /**
@@ -24,6 +24,7 @@ async function delivered(post: () => Promise<ToolOperationResult>): Promise<Tool
   try {
     return await post();
   } catch (error) {
+    if (error instanceof RoomExecutionStoppedError) throw error;
     throw new DeliveryFailedError(error);
   }
 }

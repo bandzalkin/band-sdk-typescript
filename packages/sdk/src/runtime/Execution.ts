@@ -1,4 +1,4 @@
-import { RecoverableTurnError, RuntimeStateError } from "../core/errors";
+import { RecoverableTurnError, RoomExecutionStoppedError, RuntimeStateError } from "../core/errors";
 import type { Logger } from "../core/logger";
 import { resolveLogger } from "../core/logger";
 import type { BandLink } from "../platform/BandLink";
@@ -85,7 +85,7 @@ export class Execution {
   private readonly syncBoundaries = new SyncBoundaryTracker();
   private inFlight = 0;
   /** While set, a turn that outlived its handler still runs: only its decision replies run. */
-  private hold: Promise<void> | null = null;
+  private hold: Promise<boolean> | null = null;
   /**
    * Set once the queue stops accepting new events, ahead of the lifecycle
    * itself reporting `"stopped"` (see {@link runStop}) — closing the queue
@@ -317,12 +317,18 @@ export class Execution {
   }
 
   private holdRoomUntil(ended: Promise<void>): void {
-    const hold: Promise<void> = ended.then(() => {
-      if (this.hold !== hold) return;
-      this.hold = null;
-      this.logger.debug("room released by its held turn", { roomId: this.roomId });
-      this.wake();
-      this.notifyIfIdle();
+    const release = (completed: boolean): boolean => {
+      if (this.hold === hold) {
+        this.hold = null;
+        this.logger.debug("room released by its held turn", { roomId: this.roomId });
+        this.wake();
+        this.notifyIfIdle();
+      }
+      return completed;
+    };
+    const hold = ended.then(() => release(true), (error: unknown) => {
+      if (error instanceof RoomExecutionStoppedError) return release(false);
+      throw error;
     });
     this.hold = hold;
     this.logger.debug("room held until its turn ends", { roomId: this.roomId });
@@ -380,9 +386,16 @@ export class Execution {
    * so the live delivery, which can land before or after a boundary is
    * anchored, and later catch-ups skip it.
    */
-  private async runOnce(event: PlatformEvent, messageId: string): Promise<void> {
-    await this.executeSyncMessage(event, messageId);
-    this.syncBoundaries.recordExecuted(messageId);
+  private async runOnce(event: PlatformEvent, messageId: string): Promise<boolean> {
+    if (!(await this.executeSyncMessage(event, messageId))) return false;
+    if (this.hold) {
+      void this.hold.then((completed) => {
+        if (completed) this.syncBoundaries.recordExecuted(messageId);
+      });
+    } else {
+      this.syncBoundaries.recordExecuted(messageId);
+    }
+    return true;
   }
 
   private async recoverStaleProcessingMessages(): Promise<void> {
@@ -419,7 +432,7 @@ export class Execution {
         continue;
       }
 
-      await this.runOnce(toMessageEvent(message), message.id);
+      if (!(await this.runOnce(toMessageEvent(message), message.id))) break;
     }
   }
 
@@ -453,9 +466,9 @@ export class Execution {
           this.logger.warn("Message still heads /next after it was given up on; ending sync", { roomId: this.roomId, messageId });
           break;
         }
-        await this.giveUp(messageId);
+        if (!(await this.giveUp(messageId))) break;
       } else {
-        await this.runOnce(toMessageEvent(nextMessage), messageId);
+        if (!(await this.runOnce(toMessageEvent(nextMessage), messageId))) break;
       }
 
       // Caught up to live traffic once the boundary's own message is settled.
@@ -469,15 +482,14 @@ export class Execution {
     this.notifyIfIdle();
   }
 
-  private async executeSyncMessage(event: PlatformEvent, messageId: string): Promise<void> {
+  private async executeSyncMessage(event: PlatformEvent, messageId: string): Promise<boolean> {
     if (this.retryTracker.isPermanentlyFailed(messageId) || this.retryTracker.recordAttempt(messageId)[1]) {
       this.logger.error("Message exceeded max retries during sync, giving up on it", {
         roomId: this.roomId,
         messageId,
         maxRetries: this.retryTracker.maxRetries,
       });
-      await this.giveUp(messageId);
-      return;
+      return await this.giveUp(messageId);
     }
 
     this.inFlight += 1;
@@ -487,9 +499,13 @@ export class Execution {
       await this.onExecute(this.context, event, () => this.isActive(), (ended) => this.holdRoomUntil(ended));
       this.retryTracker.markSuccess(messageId);
     } catch (error: unknown) {
+      if (error instanceof RoomExecutionStoppedError) {
+        this.retryTracker.discardAttempt(messageId);
+        return false;
+      }
       if (error instanceof RecoverableTurnError) {
         this.warnTurnFailed(error, { messageId });
-        return;
+        return true;
       }
       const label = error instanceof Error ? error.message : String(error);
       this.logger.error("Sync message execution failed", {
@@ -501,6 +517,7 @@ export class Execution {
       this.inFlight -= 1;
       this.context.setState("idle");
     }
+    return true;
   }
 
   // One turn's failure (a refused post, a provider failure, a missing reply):
@@ -523,6 +540,7 @@ export class Execution {
     try {
       await this.onExecute(this.context, event, () => this.isActive(), (ended) => this.holdRoomUntil(ended));
     } catch (error: unknown) {
+      if (error instanceof RoomExecutionStoppedError) return;
       // Scoped to the turn that raised it: `PlatformRuntime` has already
       // marked the message failed, and the queue below is every *other*
       // message in this room. Tearing all of that down — and, through
@@ -614,13 +632,15 @@ export class Execution {
   }
 
   /** Band has no give-up state: a message leaves /next only once claimed and marked processed. */
-  private async giveUp(messageId: string): Promise<void> {
-    this.retryTracker.markPermanentlyFailed(messageId);
+  private async giveUp(messageId: string): Promise<boolean> {
     try {
       await this.link.markProcessing(this.roomId, messageId);
       await this.link.markProcessed(this.roomId, messageId);
     } catch (error: unknown) {
+      if (error instanceof RoomExecutionStoppedError) return false;
       this.logger.warn("Failed to settle a given-up message", { roomId: this.roomId, messageId, error });
     }
+    this.retryTracker.markPermanentlyFailed(messageId);
+    return true;
   }
 }

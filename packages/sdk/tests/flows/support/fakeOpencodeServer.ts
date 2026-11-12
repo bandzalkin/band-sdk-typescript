@@ -378,6 +378,8 @@ async function readJson(req: IncomingMessage): Promise<Record<string, unknown>> 
 }
 
 function send(res: ServerResponse, status: number, body?: unknown): void {
+  // Finite replies must not wait on connection-pool timers while the test clock is frozen.
+  res.setHeader("connection", "close");
   if (body === undefined) {
     res.writeHead(status).end();
     return;

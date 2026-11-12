@@ -154,14 +154,16 @@ describe("OmpRpcAdapter", () => {
 
   it("fails the turn when its OMP process dies, and seeds the room's next process with the room's history", async () => {
     const omp = fakeOmpProcesses();
-    const { room, events } = await startAgent(ompAdapter(omp));
+    const { agent, room, events } = await startAgent(ompAdapter(omp));
     const prompted = omp.nextPrompt();
     const message = await room.say("owner", "first question");
     const { peer } = await prompted;
 
+    const failed = nextEvent(agent, (event) => event.type === "turn.failed" && event.messageId === message);
     peer.die(1);
 
     expect(await room.outcome(message)).toBe("failed");
+    await failed;
     expect(room.failures).toEqual([{ content: expect.stringContaining("The OMP agent process exited with code 1"), provider: "omp-rpc" }]);
     expect(ofTypes(events, "room.failed", "turn.failed").map((event) => event.type)).toEqual(["room.failed", "turn.failed"]);
 

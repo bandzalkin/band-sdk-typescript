@@ -1,4 +1,5 @@
-import { UnsupportedFeatureError, ValidationError } from "../../core/errors";
+import { RoomExecutionStoppedError, UnsupportedFeatureError, ValidationError } from "../../core/errors";
+import { roomWrite } from "../../core/roomTurn";
 import { SCOPED_TOOL_EXECUTOR, withToolActivity } from "../workingState";
 import { resolveLogger, type Logger } from "../../core/logger";
 import { ParticipantRoster, type AgentFailure, type ParticipantFields } from "@band-ai/band-sdk-core";
@@ -168,13 +169,13 @@ export class AgentTools implements AgentToolsProtocol {
 
     // No options 3rd arg: forwarding DEFAULT_REQUEST_OPTIONS here would override
     // FernRestAdapter's own MESSAGE_SEND_MAX_RETRIES cap.
-    return this.rest.createChatMessage(
+    return roomWrite(this.roomId, () => this.rest.createChatMessage(
       this.roomId,
       {
         content,
         mentions: resolvedMentions,
       },
-    );
+    ), true);
   }
 
   public async sendNotice(
@@ -193,15 +194,16 @@ export class AgentTools implements AgentToolsProtocol {
     try {
       // No options 3rd arg: forwarding DEFAULT_REQUEST_OPTIONS here would override
       // FernRestAdapter's own MESSAGE_SEND_MAX_RETRIES cap.
-      return await this.rest.createChatEvent(
+      return await roomWrite(this.roomId, () => this.rest.createChatEvent(
         this.roomId,
         {
           content,
           messageType,
           metadata,
         },
-      );
+      ), true);
     } catch (error) {
+      if (error instanceof RoomExecutionStoppedError) throw error;
       // Room telemetry, not the agent's answer: a failed post here must never
       // abort the turn the way a failed sendMessage should. See sendMessage,
       // which is deliberately left to reject. (`resolveLogger` already keeps a
@@ -408,6 +410,7 @@ export class AgentTools implements AgentToolsProtocol {
       }
       return result;
     } catch (error) {
+      if (error instanceof RoomExecutionStoppedError) throw error;
       if (isToolExecutorError(error)) {
         return error;
       }

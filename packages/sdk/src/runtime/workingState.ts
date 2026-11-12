@@ -154,7 +154,7 @@ export async function retainWorkingCycleUntil<T>(tools: AdapterToolsProtocol, wo
 export class WorkingStateReporter {
   private tail = Promise.resolve();
   private timer?: ReturnType<typeof setTimeout>;
-  private readonly leases = new Map<object, { activity: Activity; order: number; permission: boolean }>();
+  private readonly leases = new Map<object, { activity: Activity; order: number; permission: boolean; onStopped?: () => void }>();
   private sequence = 0;
   private current: Activity = REASONING;
   private invalidObservationLogged = false;
@@ -175,13 +175,13 @@ export class WorkingStateReporter {
     this.logger = resolveLogger(logger);
   }
 
-  public open(): WorkingLease {
+  public open(onStopped?: () => void): WorkingLease {
     const token = {};
     let references = 1;
     let ended: Promise<void> | undefined;
     let ready = Promise.resolve();
     if (!this.closePromise) {
-      this.leases.set(token, { activity: REASONING, order: 0, permission: false });
+      this.leases.set(token, { activity: REASONING, order: 0, permission: false, onStopped });
       if (!this.period) {
         this.current = REASONING;
         const period = this.period = {};
@@ -299,16 +299,24 @@ export class WorkingStateReporter {
   }
 
   private async send(working: boolean): Promise<void> {
+    const period = this.period;
+    const observers = working ? Array.from(this.leases.values(), (lease) => lease.onStopped) : [];
     const controller = new AbortController();
     const deadline = setTimeout(() => controller.abort(), this.config.workingRequestTimeoutSeconds * 1000);
     deadline.unref?.();
     try {
-      await this.report(working, {
+      const response = await this.report(working, {
         maxRetries: 0,
         timeoutInSeconds: this.config.workingRequestTimeoutSeconds,
         abortSignal: controller.signal,
         ...(working ? { activity: this.current } : {}),
       });
+      if (working && period && this.period === period && typeof response === "object" && response !== null
+        && "working" in response && response.working === false) {
+        this.retire();
+        this.leases.clear();
+        for (const observe of observers) observe?.();
+      }
       if (this.failureStreak) this.logger.info("Working-state reporting recovered", { roomId: this.roomId });
       this.failureStreak = false;
     } catch (error) {

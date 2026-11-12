@@ -21,7 +21,7 @@ import { BandPlatform, person, type BandRoom, type Outcome, type Posted } from "
 import { DEFAULT_CURSOR_ROOM, FakeCursorAgent, type CursorTurn } from "./support/fakeCursorAgent";
 import { activitySequence, recordRuntimeActivity } from "../support/activityReports";
 import { FAILURE_EVENT_TYPE } from "../../src/contracts/protocols";
-import { makeLoggerSpy, MISSING_REPLY, reportedFailures, tmpRoot, type ReportedFailure } from "../testUtils";
+import { makeLoggerSpy, MISSING_REPLY, tmpRoot, type ReportedFailure } from "../testUtils";
 import { ACT_TOOL, CLOSING_TEXT, contractRows, NO_REPLY_ARGS, TOOL_REPLY, type TurnScript } from "../turnOutcomeContract";
 
 const OWNER = "owner";
@@ -147,7 +147,7 @@ describe("Cursor in a Band room", () => {
       await turn.say(DONE);
     }, 1);
     try {
-      await room.outcome(message);
+      expect(room.outcomes(message)).toEqual([]);
       await reports.next((entry) => entry.activity?.kind === "permission");
       const beforeHeartbeats = platform.rest.workingReports.entries.length;
       await vi.advanceTimersByTimeAsync(2 * KEEPALIVE_MS);
@@ -553,7 +553,7 @@ describe("Cursor in a Band room", () => {
     void agent.room("room-2").nextTurn((turn) => turn.ask(ask));
     const queued = await otherRoom.say(OWNER, "And summarise room-2");
     await promptTokens(otherRoom, 1);
-    expect(await otherRoom.outcome(queued)).toBe("processed");
+    expect(otherRoom.outcomes(queued)).toEqual([]);
     const held = await otherRoom.say(OWNER, "Anything yet?");
 
     await otherRoom.remove();
@@ -566,13 +566,16 @@ describe("Cursor in a Band room", () => {
 
     const rejoined = await platform.room("room-2");
     const replayed = agent.room("room-2").nextTurn(answering(async (turn) => turn.sessionId));
+    const waitingReplay = agent.room("room-2").nextTurn(answering(async (turn) => turn.sessionId));
     const next = agent.room("room-2").nextTurn(answering(async (turn) => turn.sessionId));
     const message = await rejoined.say(OWNER, "Summarise room-2 again");
     // The fresh process first catches up on the request the removal left unanswered.
     expect(await replayed).toBe("cursor-session-1");
+    expect(await waitingReplay).toBe("cursor-session-1");
     expect(JSON.stringify(agent.receivedOf("session/prompt").at(-1))).toContain("Anything yet?");
     await next;
     expect(agent.room("room-2").launches).toBe(2);
+    expect(await rejoined.outcome(queued)).toBe("processed");
     expect(await rejoined.outcome(held)).toBe("processed");
     expect(await rejoined.outcome(message)).toBe("processed");
   });
@@ -659,14 +662,14 @@ describe("Cursor in a Band room", () => {
       await turn.ask(MODE);
       await script(turn);
     }, 1);
-    expect(await room.outcome(message)).toBe("processed");
+    expect(room.outcomes(message)).toEqual([]);
     expect(await room.exchange(OWNER, `${CURSOR_COMMAND} answer ${token} mode=plan`)).toEqual([SAYS.resolved("question", token!)]);
     await session.afterTurn();
 
     // The decision prompt was only a notice, so the answer after it is still relayed.
     expect(room.messages.map((posted) => posted.content)).toEqual([SAYS.questionPrompt(token!), SAYS.resolved("question", token!), ...relayed, DONE]);
     expect(room.failures).toEqual(failures);
-    expect(room.outcomes(message), "the request was already handed back").toEqual(["processed"]);
+    expect(room.outcomes(message)).toEqual(["processed"]);
   });
 
   it("holds an ordinary message and settles control messages during a handed-back turn, and keeps that turn's own reply on it", async () => {
@@ -694,29 +697,6 @@ describe("Cursor in a Band room", () => {
     expect(room.outcomes(message)).toEqual(["processed"]);
   });
 
-  // The cancel closes the ACP connection under the turn, whose own failure report completes it first; Band refuses
-  // that report, since the agent has left the room.
-  it("ends a handed-back turn cancelled by the agent leaving the room once, by its own failure, not a missing reply", async () => {
-    const logger = makeLoggerSpy();
-    await using session = await cursorRoom({ logger });
-    const { room, platform } = session;
-    const { message } = await session.start((turn) => turn.ask(MODE), 1);
-    expect(await room.outcome(message)).toBe("processed");
-
-    await room.remove();
-    // Logged once the cancelled turn has fully unwound, past the point it would report.
-    await vi.waitFor(() => expect(logger.warn).toHaveBeenCalledWith(RELEASED_TURN_FAILED, expect.anything()));
-    expect(logger.warn.mock.calls.filter(([event]) => event === RELEASED_TURN_FAILED)).toHaveLength(1);
-    const refused = platform.rest.refused.entries;
-    expect(refused.map(({ roomId, call }) => ({ roomId, call }))).toEqual([{ roomId: room.id, call: "reportActivity" }, { roomId: room.id, call: "createChatEvent" }]);
-    const reports = reportedFailures(refused.flatMap(({ attempt }) => attempt ?? []));
-    expect(reports).toHaveLength(1);
-    expect(reports).not.toContainEqual(MISSING_REPLY);
-
-    // The runtime keeps serving the agent's other rooms.
-    const otherRoom = await platform.room("room-2");
-    expect(await otherRoom.exchange(OWNER, CURSOR_COMMAND)).toEqual([SAYS.pendingList([])]);
-  });
 
   // `reportTurnFailure` swallows a refused report, so the turn's verdict still reads missing_reply.
   it("never reports a missing reply for a handed-back turn that failed, even when the platform refused its failure report", async () => {
@@ -862,7 +842,9 @@ describe("Cursor holds the room's other work until a handed-back turn ends", () 
     await bootstrapped.ran;
 
     const processed = platform.rest.settled.entries.filter((entry) => entry.outcome === "processed").map((entry) => entry.messageId);
-    expect(processed).toEqual([message, answer, first, second, bootstrapped.id]);
+    expect(processed.filter((id) => id !== message && id !== answer)).toEqual([first, second, bootstrapped.id]);
+    expect(room.outcomes(message)).toEqual(["processed"]);
+    expect(room.outcomes(answer)).toEqual(["processed"]);
     expect(room.messages.filter((posted) => !isPrompt(posted)).map((posted) => posted.content).slice(-4)).toEqual([
       DONE, "First answer.", "Second answer.", "Bootstrapped answer.",
     ]);

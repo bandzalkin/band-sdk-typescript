@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { RecoverableTurnError, RuntimeStateError } from "../src/core/errors";
+import { RecoverableTurnError, RoomExecutionStoppedError, RuntimeStateError } from "../src/core/errors";
 import type { PlatformEvent } from "../src/platform/events";
 import { Execution } from "../src/runtime/Execution";
 import { makeLoggerSpy } from "./testUtils";
@@ -445,6 +445,30 @@ describe("Execution crash recovery", () => {
     // Seen once to give up on, once more still heading /next: then the scan ends.
     expect(backlog.polls).toBe(2);
     await execution.stop();
+  });
+
+  it("can finish a give-up after Play when its earlier processing write was stopped", async () => {
+    const context = makeContext(1);
+    context.retryTracker.recordAttempt("stopped-give-up");
+    const backlog = new FakeBacklog([makeBacklogMessage("stopped-give-up")]);
+    const link = backlog.link();
+    const processing = link.markProcessing;
+    let stopped = true;
+    link.markProcessing = async (roomId, messageId) => {
+      if (stopped) throw new RoomExecutionStoppedError(roomId);
+      await processing(roomId, messageId);
+    };
+    const execution = new Execution({
+      roomId: "room-1", link: link as never, context: context as never, onExecute: async () => {},
+    });
+    try {
+      await execution.waitForIdle();
+      expect(backlog.processed.has("stopped-give-up")).toBe(false);
+      stopped = false;
+      await execution.enqueue(makeReconnectedEvent());
+      await execution.waitForIdle();
+      expect(backlog.processed.has("stopped-give-up")).toBe(true);
+    } finally { await execution.stop(); }
   });
 
   it("gives up on a stale-recovered message /next still serves, instead of running it again", async () => {

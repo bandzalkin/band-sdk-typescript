@@ -8,7 +8,7 @@ import { createDeferred } from "../src/core/deferred";
 import { BandLink } from "../src/platform/BandLink";
 import { AGENT_API_KEY, AGENT_ID, BandPlatform, person, type BandRoom } from "./flows/support/bandPlatform";
 import { inMemoryAgent } from "./support/inMemoryAcpAgent";
-import { tmpRoot } from "./testUtils";
+import { RecordLog, tmpRoot } from "./testUtils";
 
 const ROOM = "room-1";
 
@@ -82,22 +82,22 @@ async function startAgent(adapter: ACPClientAdapter) {
     apiKey: AGENT_API_KEY,
     link: new BandLink({ agentId: AGENT_ID, apiKey: AGENT_API_KEY, ...platform.link }),
   });
-  const events: AgentEvent[] = [];
-  agent.observe((event) => { events.push(event); });
+  const eventLog = new RecordLog<AgentEvent>();
+  agent.observe((event) => { eventLog.record(event); });
   await agent.start();
   onTestFinished(async () => { if (agent.isRunning) await agent.stop(); });
-  return { agent, platform, events, room: await platform.room(ROOM) };
+  return { agent, platform, events: eventLog.entries, eventLog, room: await platform.room(ROOM) };
 }
 
 const posted = (room: BandRoom) => room.posted.map(({ messageType, content }) => [messageType, content]);
-const ofTypes = (events: AgentEvent[], ...types: AgentEvent["type"][]) => events.filter((event) => types.includes(event.type));
+const ofTypes = (events: readonly AgentEvent[], ...types: AgentEvent["type"][]) => events.filter((event) => types.includes(event.type));
 
 describe("Agent.observe", () => {
   it("reports an ACP turn's thought and tool call locally, before and without posting anything for them", async () => {
     const observed = createDeferred();
     const release = createDeferred();
     onTestFinished(() => release.resolve());
-    const { agent, events, room } = await startAgent(acpAdapter((peer, { sessionId }) => workThenAnswer(peer, sessionId, async () => {
+    const { agent, events, eventLog, room } = await startAgent(acpAdapter((peer, { sessionId }) => workThenAnswer(peer, sessionId, async () => {
       await observed.promise;
       await release.promise;
     })));
@@ -114,6 +114,7 @@ describe("Agent.observe", () => {
 
     release.resolve();
     expect(await room.outcome(message)).toBe("processed");
+    await eventLog.next((event) => event.type === "turn.completed" && event.messageId === message);
     expect(ofTypes(events, "turn.started", "message", "turn.completed")).toEqual([
       { type: "turn.started", roomId: ROOM, messageId: message },
       { type: "message", roomId: ROOM, text: "Found three notes." },
@@ -136,7 +137,7 @@ describe("Agent.observe", () => {
   });
 
   it("keeps a turn and the other listeners going when one listener throws or rejects", async () => {
-    const { agent, events, room } = await startAgent(acpAdapter((peer, { sessionId }) => workThenAnswer(peer, sessionId)));
+    const { agent, events, eventLog, room } = await startAgent(acpAdapter((peer, { sessionId }) => workThenAnswer(peer, sessionId)));
     agent.observe(() => { throw new Error("listener bug"); });
     agent.observe(async () => { throw new Error("async listener bug"); });
     const later: AgentEvent[] = [];
@@ -144,6 +145,7 @@ describe("Agent.observe", () => {
 
     const message = await room.say("owner", "what is in my notes?");
     expect(await room.outcome(message)).toBe("processed");
+    await eventLog.next((event) => event.type === "turn.completed" && event.messageId === message);
     expect(room.messages.map((entry) => entry.content)).toEqual(["Found three notes."]);
     for (const seen of [events, later]) {
       expect(ofTypes(seen, "turn.started", "thought", "tool.call", "tool.result", "turn.completed").map((event) => event.type))
@@ -189,9 +191,10 @@ describe("Agent.observe", () => {
   });
 
   it("reports a turn the adapter fails", async () => {
-    const { events, room } = await startAgent(acpAdapter(async () => { throw new Error("agent crashed"); }));
+    const { events, eventLog, room } = await startAgent(acpAdapter(async () => { throw new Error("agent crashed"); }));
     const message = await room.say("owner", "hello");
     expect(await room.outcome(message)).toBe("failed");
+    await eventLog.next((event) => event.type === "turn.failed" && event.messageId === message);
     expect(ofTypes(events, "turn.started", "turn.completed", "turn.failed")).toEqual([
       { type: "turn.started", roomId: ROOM, messageId: message },
       { type: "turn.failed", roomId: ROOM, messageId: message, error: expect.any(String) },

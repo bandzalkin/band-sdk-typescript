@@ -1,4 +1,4 @@
-import { hasStatusCode, HTTP_UNPROCESSABLE, UnsupportedFeatureError } from "../../core/errors";
+import { hasStatusCode, HTTP_UNPROCESSABLE, RoomExecutionStoppedError, UnsupportedFeatureError } from "../../core/errors";
 import { asNullableString, asOptionalRecord, asString } from "../../adapters/shared/coercion";
 import type {
   GetBoardArgs, SetBoardArgs, ListTasksArgs, CreateTaskArgs, UpdateTaskArgs, WireBoard, WireTask, WireTaskPage,
@@ -38,6 +38,17 @@ import type {
   PaginatedResponse,
   PlatformChatMessage,
 } from "./types";
+
+/** Only the execution-write 204 is a stop; an injected client's undefined result is not evidence. */
+async function acceptedExecutionResponse(chatId: string, request: Promise<unknown>): Promise<unknown> {
+  const raw = request as Promise<unknown> & {
+    withRawResponse?: () => Promise<{ data: unknown; rawResponse: { status: number } }>;
+  };
+  if (!raw.withRawResponse) return await request;
+  const { data, rawResponse } = await raw.withRawResponse();
+  if (rawResponse.status === 204) throw new RoomExecutionStoppedError(chatId);
+  return data;
+}
 
 function mergeOptions(options?: RestRequestOptions, maxRetries?: number): RestRequestOptions {
   return {
@@ -653,7 +664,7 @@ export class FernRestAdapter implements RestApi {
       throw new UnsupportedFeatureError("Fern client missing mark message processing endpoint");
     }
 
-    const response = await api(chatId, messageId, mergeOptions(options));
+    const response = await acceptedExecutionResponse(chatId, api(chatId, messageId, mergeOptions(options)));
     return normalizeToolOperationResult(response);
   }
 
@@ -668,7 +679,7 @@ export class FernRestAdapter implements RestApi {
       throw new UnsupportedFeatureError("Fern client missing mark message processed endpoint");
     }
 
-    const response = await api(chatId, messageId, mergeOptions(options));
+    const response = await acceptedExecutionResponse(chatId, api(chatId, messageId, mergeOptions(options)));
     return normalizeToolOperationResult(response);
   }
 
@@ -684,12 +695,12 @@ export class FernRestAdapter implements RestApi {
       throw new UnsupportedFeatureError("Fern client missing mark message failed endpoint");
     }
 
-    const response = await api(
+    const response = await acceptedExecutionResponse(chatId, api(
       chatId,
       messageId,
       { error },
       mergeOptions(options),
-    );
+    ));
     return normalizeToolOperationResult(response);
   }
 

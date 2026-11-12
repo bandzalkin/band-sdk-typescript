@@ -15,7 +15,8 @@ import type {
   BandLinkRestApi,
 } from "../client/rest/types";
 import { messageIdOf, type PlatformEvent, type SupportedSocketEvent } from "./events";
-import { UnsupportedFeatureError } from "../core/errors";
+import { RoomExecutionStoppedError, UnsupportedFeatureError } from "../core/errors";
+import { roomWrite } from "../core/roomTurn";
 import { assertCapability, pruneUnsupported } from "../contracts/capabilities";
 import type { MetadataMap } from "../contracts/dtos";
 import type { PlatformMessageLike as PlatformMessage } from "../contracts/protocols";
@@ -533,9 +534,9 @@ export class BandLink implements AsyncIterable<PlatformEvent> {
     options?: MessageMarkOptions,
   ): Promise<void> {
     try {
-      await mark();
+      await roomWrite(context.roomId, mark);
     } catch (error: unknown) {
-      if (!options?.bestEffort) {
+      if (error instanceof RoomExecutionStoppedError || !options?.bestEffort) {
         throw error;
       }
 
