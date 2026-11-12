@@ -103,6 +103,8 @@ another post or mark. Pending Cursor questions and plans are cancelled and their
 old tokens remain invalid after Play; OpenCode also rejects its pending asks.
 A held operation that rejects still finalizes once, as stopped during Stop or as
 a failed turn otherwise.
+If Stop arrives during OpenCode setup, that turn never submits its prompt. A late
+prompt response cannot restore a session that cancellation already abandoned.
 
 
 ### Observing an agent

@@ -11,6 +11,8 @@
 * **runtime:** preserve accepted reply receipts across Stop so an operation retry after Play cannot duplicate the reply.
 * **adapters:** cancel pending Cursor and OpenCode decisions with their turn; old decision tokens cannot approve work after Stop.
 * **runtime:** finalize rejected held operations as stopped or failed instead of leaving the inbound and observer turn unfinished.
+* **adapters:** keep stopped OpenCode sessions abandoned when an old prompt is accepted late.
+* **adapters:** cancel OpenCode session setup without submitting a prompt after Stop.
 
 
 ## [2.0.0](https://github.com/band-ai/band-sdk-typescript/compare/sdk-v1.0.0...sdk-v2.0.0) (2026-11-09)

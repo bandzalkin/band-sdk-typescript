@@ -195,7 +195,7 @@ interface RoomState {
   tools: TurnTools;
   turn: OpencodeTurn | null;
   // Held while a message sets up its turn, across the awaits before it claims `turn`, so a second message waits as busy.
-  starting: boolean;
+  starting: { cancelled: boolean } | null;
   // The latest turn's requester; every room message mentions them, since the platform drops one that mentions nobody.
   requesterMentions: MentionInput;
   decisions: RoomDecisions;
@@ -335,19 +335,30 @@ export class OpencodeAdapter extends SimpleAdapter<OpencodeSessionState, TurnToo
       return;
     }
 
-    roomState.starting = true;
+    const starting = { cancelled: false };
+    roomState.starting = starting;
     try {
       let setup: { client: OpencodeClientLike; sessionId: string; needsHistoryReplay: boolean };
       try {
         const client = await this.ensureClientStarted();
+        if (starting.cancelled) {
+          tools.turn.settle();
+          return;
+        }
         const { sessionId, created, needsHistoryReplay } = await this.ensureSession(roomState, client, history);
-        if (this.config.enableTaskEvents && (roomState.persistedSessionId !== sessionId || context.isSessionBootstrap)) {
+        if (!starting.cancelled && this.config.enableTaskEvents && (roomState.persistedSessionId !== sessionId || context.isSessionBootstrap)) {
           await this.emitSessionTaskEvent(roomState, tools, sessionId, created ? "created" : "resumed");
         }
         setup = { client, sessionId, needsHistoryReplay };
       } finally {
         // Released with no await before `startTurn` claims `turn`.
-        roomState.starting = false;
+        roomState.starting = null;
+      }
+
+      if (starting.cancelled) {
+        this.abortAndAbandonSession(roomState);
+        tools.turn.settle();
+        return;
       }
 
       const { client, sessionId, needsHistoryReplay } = setup;
@@ -402,7 +413,8 @@ export class OpencodeAdapter extends SimpleAdapter<OpencodeSessionState, TurnToo
     // Only now has a forced-fresh replacement's history replay actually been
     // submitted — see `ensureSession`'s comment on why clearing the flag
     // can't happen there, before this call was known to succeed.
-    roomState.forceFreshSession = false;
+    // Cancellation clears the current turn and keeps its session abandoned.
+    if (roomState.turn === turn) roomState.forceFreshSession = false;
 
     await runUntilReleased(turn.tools, (complete) => this.watchTurnCompletion(roomState, turn, complete), turn.released, this.logger, { roomId: roomState.roomId }, (error) => {
       this.logger.error("OpenCode turn failed after the request returned", { error, roomId });
@@ -411,7 +423,12 @@ export class OpencodeAdapter extends SimpleAdapter<OpencodeSessionState, TurnToo
 
   public async cancelTurn(roomId: string): Promise<boolean> {
     const roomState = this.rooms.get(roomId);
-    if (!roomState?.turn) return false;
+    if (!roomState) return false;
+    if (roomState.starting) {
+      roomState.starting.cancelled = true;
+      return true;
+    }
+    if (!roomState.turn) return false;
     const { permissions, questions } = roomState.decisions;
     const cancelledPermissions = permissions.cancelAll();
     const cancelledQuestions = questions.cancelAll();
@@ -464,7 +481,7 @@ export class OpencodeAdapter extends SimpleAdapter<OpencodeSessionState, TurnToo
       decisions: new RoomDecisions(this.logger),
       persistedSessionId: null,
       forceFreshSession: false,
-      starting: false,
+      starting: null,
     };
     this.rooms.set(roomId, created);
     return created;
