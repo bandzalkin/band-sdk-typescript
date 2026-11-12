@@ -1,5 +1,5 @@
 export { Agent } from "./agent/Agent";
-export type { AgentCreateOptions } from "./agent/Agent";
+export type { AgentCreateOptions, AgentRooms, AllowRoomOptions } from "./agent/Agent";
 
 export { BandLink, deriveDefaultRestUrl } from "./platform/BandLink";
 export type { PlatformEvent, ContactEvent, ReconnectedEvent } from "./platform/events";
@@ -69,6 +69,7 @@ export { OpencodeAdapter } from "./adapters/opencode";
 export { ClaudeSDKAdapter } from "./adapters/claude-sdk";
 export { CodexAdapter } from "./adapters/codex";
 export { OmpACPAdapter, DEFAULT_OMP_ACP_COMMAND } from "./adapters/omp-acp";
+export { OmpRpcAdapter, DEFAULT_OMP_RPC_COMMAND } from "./adapters/omp-rpc";
 export {
   ACPClientAdapter,
   AcpSessionConfigError,
@@ -104,6 +105,7 @@ export type {
   AgentEventType,
   ApprovalOutcome,
   LinkDisconnectReason,
+  RoomAgentIdentity,
   RoomPauseSource,
   ToolCallEndStatus,
   TurnStopMode,
@@ -137,6 +139,9 @@ export type {
   CodexWebSearchMode,
   ToolCallingModel,
   OmpACPAdapterOptions,
+  OmpRpcAdapterOptions,
+  OmpPermissionRequest,
+  OmpPermissionEndReason,
   ACPClientAdapterOptions,
   ACPClientAdapterBaseOptions,
   ACPClientStdioOptions,
