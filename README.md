@@ -90,9 +90,12 @@ write answered with HTTP 204, or a message/event post refused with HTTP 403 and
 
 Stop uses the adapter's `cancelTurn` hook, cancels pending approvals, and refuses
 late replies and terminal marks. The inbound stays unprocessed, including when its
-turn was handed back to wait for a decision. After Play, normal `/messages/next`
-catch-up replays it; no host resume call is required. Withdrawing a room also stops
-its running turn without posting a provider failure.
+turn was handed back to wait for a decision. A Play push on `agent.control` runs
+`/messages/next` catch-up for its room, or all admitted rooms when no room id is
+given. A held turn defers that catch-up until it ends. If the push is missed, the
+message waits for the next reconnect's catch-up. Stop and Interrupt pushes do not
+cancel turns. Withdrawing a room also stops its running turn without posting a
+provider failure.
 
 
 ### Observing an agent
@@ -108,8 +111,9 @@ const stop = agent.observe((event) => {
 Every adapter reports `turn.started`, `turn.completed` and `turn.failed`, `room.joined`, `room.left` and `room.stopped`, `room.ready` (and, for an adapter whose room process cannot start, `room.failed`) for a room allowed with `warm`, and `link.connected` and `link.disconnected` (`dropped` while the socket retries on its own, `closed` on a local disconnect, `terminal` when it ended for good). `ACPClientAdapter` and its subclasses, and `OmpRpcAdapter`, also report what their agent streams as it arrives: `thought` and `message` text, `tool.call` and `tool.result`, `approval.requested` and `approval.resolved`, and `room.failed` when the room's agent process cannot start or exits on its own. Each tool call is reported once, when its arguments arrive (or just before its result, for a call that has none), and named by the agent's own tool name when its ACP bridge reports one, else by its ACP `kind` — never by its display title, which can hold a whole command line. Arguments and results are passed through as the agent sent them, so redact them before logging. Listeners run synchronously in event order, so keep them quick; one that throws or rejects is logged and skipped without failing the turn or the other listeners.
 
 A stopped turn reports `turn.completed` with `outcome: "stopped"` and
-`cause: "platform"` or `"withdrawal"`, not `turn.failed`. Ordinary
-`turn.completed` events retain their existing shape.
+`cause: "platform"` or `"withdrawal"`, not `turn.failed`. A refusal before
+`turn.started` emits no turn completion. Ordinary `turn.completed` events retain
+their existing shape.
 
 
 ### Reading a room's history

@@ -308,6 +308,7 @@ export class FakeTransport implements StreamingTransport {
   /** Every currently-registered reconnect observer — a real transport only ever settles once per generation, but exposing the full set (rather than the last-registered one) lets a test assert exactly how many a caller has live at once. */
   public readonly observers = new Set<ReconnectObserver>();
   public readonly rejoinObservers = new Set<TopicRejoinObserver>();
+  private readonly controlObservers = new Set<(payload: Record<string, unknown>) => void>();
   /** Every topic bound, in order; await it to act once a subscription is in place. */
   public readonly bound = new RecordLog<string>();
   /** Every topic left, in order; await it to act once an unsubscribe has begun. */
@@ -502,6 +503,10 @@ export class FakeTransport implements StreamingTransport {
   }
 
   public async emit(topic: string, event: string, payload: Record<string, unknown>): Promise<void> {
+    if (event === "agent.control" && topic.startsWith("agent_control:")) {
+      for (const observer of this.controlObservers) observer(payload);
+      return;
+    }
     const topicHandlers = this.handlers.get(topic);
     const handler = topicHandlers?.[event];
     if (!handler) {
@@ -527,6 +532,11 @@ export class FakeTransport implements StreamingTransport {
   public onTopicRejoined(observer: TopicRejoinObserver): () => void {
     this.rejoinObservers.add(observer);
     return () => this.rejoinObservers.delete(observer);
+  }
+
+  public onAgentControl(observer: (payload: Record<string, unknown>) => void): () => void {
+    this.controlObservers.add(observer);
+    return () => this.controlObservers.delete(observer);
   }
 
   /** Simulates one channel rejoining on a socket that never dropped. */

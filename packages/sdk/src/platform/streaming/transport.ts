@@ -95,4 +95,6 @@ export interface StreamingTransport {
    * `onTerminal` instead. Returns an unsubscribe function.
    */
   onDropped?(observer: DropObserver): () => void;
+  /** Optional: raw agent.control pushes from this agent's authenticated control channel. */
+  onAgentControl?(observer: (payload: Record<string, unknown>) => void): () => void;
 }

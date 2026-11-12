@@ -7,6 +7,7 @@ import { BandLink } from "../src/platform/BandLink";
 import { WebSocketDisconnectError } from "../src/platform/streaming/disconnectReason";
 import { PlatformRuntime } from "../src/runtime/PlatformRuntime";
 import { FakeRestApi } from "./testUtils";
+import { BandPlatform, person } from "./flows/support/bandPlatform";
 
 const phoenixMock = vi.hoisted(() => {
   type Outcome = "ok" | "error" | "timeout" | "pending";
@@ -1147,6 +1148,34 @@ describe("PhoenixChannelsTransport", () => {
     });
 
     await expect(runForever).rejects.toBeInstanceOf(WebSocketDisconnectError);
+  });
+
+  it("drains a queued inbound on the native agent.control Play push without reconnecting", async () => {
+    const platform = BandPlatform.host([person("owner")]);
+    const room = await platform.room("room-1");
+    const initial = platform.rest.nextMessageHolds.hold((roomId) => roomId === room.id);
+    await using runtime = new PlatformRuntime({
+      agentId: "agent-1", apiKey: "key-1",
+      link: new BandLink({ agentId: "agent-1", apiKey: "key-1", restApi: platform.rest, wsUrl: "wss://example.test/socket" }),
+    });
+    const starting = runtime.start(new GenericAdapter(async ({ tools }) => {
+      await tools.sendMessage("The queued answer", ["owner"]);
+    }));
+    try {
+      await initial.sending;
+      // The in-flight startup /next already captured an empty backlog. No message push follows.
+      const messageId = room.postBeforeConnect("owner", "Answer after Play");
+      initial.release();
+      await starting;
+      const socket = phoenixMock.FakeSocket.instances[0]!;
+      const connects = socket.connectCount;
+      socket.channels.get(agentControlTopic("agent-1"))!.emit("agent.control", {
+        type: "agent.control", mode: "play", scope: "room", agent_id: "agent-1", room_id: room.id,
+      });
+      await vi.waitFor(() => expect(room.messages.map((message) => message.content)).toEqual(["The queued answer"]));
+      expect(await room.outcome(messageId)).toBe("processed");
+      expect(socket.connectCount).toBe(connects);
+    } finally { initial.release(); }
   });
 
   it("cleans up in-flight executions after terminal supersede", async () => {

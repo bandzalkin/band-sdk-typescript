@@ -1,3 +1,4 @@
+import { agentControlTopic } from "@band-ai/band-sdk-core";
 import { BandClient } from "@band-ai/rest-client";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -74,6 +75,12 @@ async function runningRoom(adapter: FrameworkAdapter, journalDir?: string) {
     ? server.rest.markMessageProcessed(roomId, id) : processed(roomId, id);
   rest.markMessageFailed = (roomId, id, error) => server.lifecycleStopped.has(roomId)
     ? server.rest.markMessageFailed(roomId, id, error) : failed(roomId, id, error);
+  const nextRequests = new RecordLog<string>();
+  const getNext = platform.rest.getNextMessage.bind(platform.rest);
+  rest.getNextMessage = async (request) => {
+    nextRequests.record(request.chatId);
+    return server.stopped.has(request.chatId) ? null : await getNext(request);
+  };
   const tools = new RecordLog<AdapterToolsProtocol>();
   const onEvent = adapter.onEvent.bind(adapter);
   adapter.onEvent = async (input) => {
@@ -92,7 +99,7 @@ async function runningRoom(adapter: FrameworkAdapter, journalDir?: string) {
   const events = new RecordLog<AgentEvent>();
   agent.observe((event) => events.record(event));
   await agent.start();
-  return { agent, platform, room, server, events, tools, link, async [Symbol.asyncDispose]() { await agent.stop(0); } };
+  return { agent, platform, room, server, events, tools, link, nextRequests, async [Symbol.asyncDispose]() { await agent.stop(0); } };
 }
 
 function ompAdapter(options: Partial<OmpRpcAdapterOptions> = {}) {
@@ -273,9 +280,14 @@ describe("room Stop through the runtime and adapters", () => {
     } finally { await prompt.finish(); vi.useRealTimers(); }
   });
 
-  it.each(["ACP", "OMP"] as const)("%s replays the stopped inbound through next after Play, without reviving its old tools", async (protocol) => {
+  it.each([
+    ["ACP", "room"], ["OMP", "room"], ["ACP", "execution"], ["OMP", "execution"],
+  ] as const)("%s replays through the %s Play push without a reconnect or revived old tools", async (protocol, scope) => {
     const provider = protocolPeer(protocol);
     await using session = await runningRoom(provider.adapter, tmpRoot());
+    await session.platform.room("room-2");
+    await session.events.next((event) => event.type === "room.joined" && event.roomId === "room-2");
+    await session.nextRequests.next((roomId) => roomId === "room-2");
     vi.useFakeTimers();
     const first = provider.next();
     const messageId = await session.room.say("owner", "Replay this after Play");
@@ -286,10 +298,20 @@ describe("room Stop through the runtime and adapters", () => {
       await prompt.finish();
       await session.events.next((event) => event.type === "turn.completed" && event.messageId === messageId);
       const oldTools = session.tools.entries[0]!;
-      session.server.stopped.delete(ROOM); // Play changes the platform, not a local pause latch.
+      session.server.stopped.delete(ROOM);
       const replay = provider.next();
-      await session.platform.transport.triggerReconnect({ generation: 2, joinedTopics: new Set() });
+      const nextFrom = session.nextRequests.entries.length;
+      await session.platform.transport.emit(agentControlTopic(AGENT_ID), "agent.control", {
+        type: "agent.control", mode: "play", scope, agent_id: AGENT_ID,
+        execution_id: scope === "execution" ? "execution-1" : null,
+        room_id: scope === "room" ? ROOM : null,
+      });
+      await vi.waitFor(() => expect(session.tools.entries).toHaveLength(2), { timeout: 200 });
       const replayed = await replay;
+      const swept = session.nextRequests.entries.slice(nextFrom);
+      expect(swept).toContain(ROOM);
+      if (scope === "room") expect(swept).not.toContain("room-2");
+      else expect(swept).toContain("room-2");
       await expect(oldTools.sendMessage("Obsolete reply", ["owner"])).rejects.toMatchObject({ name: "RoomExecutionStoppedError" });
       await replayed.reply("Replayed answer");
       await replayed.finish();
@@ -297,6 +319,50 @@ describe("room Stop through the runtime and adapters", () => {
       expect(session.room.messages.map((message) => message.content)).toEqual(["Replayed answer"]);
       expect(session.tools.entries).toHaveLength(2);
     } finally { await prompt.finish(); vi.useRealTimers(); }
+  });
+
+  it.each(["stop", "interrupt"] as const)("%s pushes cancel neither of two running turns", async (mode) => {
+    const provider = protocolPeer("OMP");
+    await using session = await runningRoom(provider.adapter);
+    const otherRoom = await session.platform.room("room-2");
+    const first = provider.next();
+    const messageId = await session.room.say("owner", "Keep this turn running");
+    const prompt = await first;
+    const second = provider.next("room-2");
+    const otherId = await otherRoom.say("owner", "Keep this room running too");
+    const other = await second;
+    try {
+      await session.platform.transport.emit(agentControlTopic(AGENT_ID), "agent.control", {
+        type: "agent.control", mode, scope: "execution", agent_id: AGENT_ID, execution_id: "execution-1", room_id: null,
+      });
+      await prompt.reply("First answer");
+      await prompt.finish();
+      await other.reply("Other answer");
+      await other.finish();
+      expect(await session.room.outcome(messageId)).toBe("processed");
+      expect(await otherRoom.outcome(otherId)).toBe("processed");
+      expect(prompt.cancelled()).toBe(false);
+      expect(other.cancelled()).toBe(false);
+      expect(session.room.messages.map((message) => message.content)).toEqual(["First answer"]);
+      expect(otherRoom.messages.map((message) => message.content)).toEqual(["Other answer"]);
+    } finally { await prompt.finish(); await other.finish(); }
+  });
+
+  it.each(["processing", "activity"] as const)("a %s Stop before startup emits no turn completion", async (signal) => {
+    const { adapter } = ompAdapter();
+    const cancelled = createDeferred();
+    const cancel = adapter.cancelTurn.bind(adapter);
+    adapter.cancelTurn = async (roomId) => { const result = await cancel(roomId); cancelled.resolve(); return result; };
+    await using session = await runningRoom(adapter);
+    if (signal === "processing") session.server.lifecycleStopped.add(ROOM);
+    else session.server.stopped.add(ROOM);
+    const messageId = await session.room.say("owner", "Do not start while stopped");
+    await cancelled.promise;
+    await session.agent.stop(1000);
+    expect(session.events.entries.filter((event) => "messageId" in event && event.messageId === messageId)).toEqual([]);
+    expect(session.room.posted).toEqual([]);
+    expect(session.room.outcomes(messageId)).toEqual([]);
+    expect(session.tools.entries).toEqual([]);
   });
 
   it("cancels a held OMP approval and waits for prompt_result followed by session_settled", async () => {

@@ -98,6 +98,8 @@ export type ContactRemovedEvent = BaseEvent<"contact_removed", ContactRemovedPay
  * `Execution` can re-run its `/next` synchronization boundary. Also queued,
  * with `roomId` set to that room, when a single chat channel rejoins on a
  * socket that never dropped, since what was sent while it was gone is lost.
+ * Play on the agent control channel requests the same catch-up: a room id
+ * scopes it to that room; no room id sweeps all rooms without guessing a cancel target.
  */
 export type ReconnectedEvent = BaseEvent<"reconnected", Record<string, never>>;
 

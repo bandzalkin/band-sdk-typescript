@@ -6,6 +6,7 @@
  */
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
+import { agentControlTopic } from "@band-ai/band-sdk-core";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { CursorACPAdapter, type CursorACPAdapterOptions } from "../../src/adapters/cursor-acp";
@@ -17,7 +18,7 @@ import { DEFAULT_WORKSPACE_DIRECTORY } from "../../src/adapters/shared/roomWorks
 import { sessionConfigSchema } from "../../src/runtime/types";
 import { NO_REPLY_TOOL_NAME, SEND_MESSAGE_TOOL_NAME } from "../../src/contracts/toolSchemas";
 import { ACP_SESSION_EVENT } from "../../src/converters/acp-client";
-import { BandPlatform, person, type BandRoom, type Outcome, type Posted } from "./support/bandPlatform";
+import { AGENT_ID, BandPlatform, person, type BandRoom, type Outcome, type Posted } from "./support/bandPlatform";
 import { DEFAULT_CURSOR_ROOM, FakeCursorAgent, type CursorTurn } from "./support/fakeCursorAgent";
 import { activitySequence, recordRuntimeActivity } from "../support/activityReports";
 import { FAILURE_EVENT_TYPE } from "../../src/contracts/protocols";
@@ -674,7 +675,7 @@ describe("Cursor in a Band room", () => {
 
   it("holds an ordinary message and settles control messages during a handed-back turn, and keeps that turn's own reply on it", async () => {
     await using session = await cursorRoom();
-    const { room, agent } = session;
+    const { room, agent, platform } = session;
     const { message, tokens: [token] } = await session.start(async (turn) => {
       await turn.ask(MODE);
       await TURN_SCRIPTS.toolReply(turn);
@@ -682,6 +683,7 @@ describe("Cursor in a Band room", () => {
 
     const followUp = agent.nextTurn(answering(async () => undefined));
     const waiting = await room.say(OWNER, "Is it done yet?");
+    await platform.transport.emit(agentControlTopic(AGENT_ID), "agent.control", { mode: "play", scope: "room", room_id: room.id });
     expect(await room.outcome(await room.say(OWNER, CURSOR_COMMAND))).toBe("processed");
     expect(room.outcomes(waiting), "held while the turn waits on its decision").toEqual([]);
     expect(await room.outcome(await room.say(OWNER, `${CURSOR_COMMAND} answer ${token} mode=plan`))).toBe("processed");

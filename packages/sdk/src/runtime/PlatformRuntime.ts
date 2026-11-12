@@ -630,7 +630,7 @@ export class PlatformRuntime implements AsyncDisposable {
           await turn.close();
           if (turn.stopCause) {
             context.releaseMessage(messageId);
-            this.events.emit({ type: "turn.completed", roomId, messageId, outcome: "stopped", cause: turn.stopCause });
+            if (started) this.events.emit({ type: "turn.completed", roomId, messageId, outcome: "stopped", cause: turn.stopCause });
           } else if (started) {
             this.events.emit(succeeded
               ? { type: "turn.completed", roomId, messageId }

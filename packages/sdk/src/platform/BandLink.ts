@@ -242,6 +242,12 @@ export class BandLink implements AsyncIterable<PlatformEvent> {
       this.reportConnection({ connected: true, reconnected: true });
     });
     const stopRejoined = this.transport.onTopicRejoined?.((topic) => this.queueRejoinCatchUp(topic, epoch));
+    const stopControl = this.transport.onAgentControl?.((payload) => {
+      if (this.session.isStale(epoch) || payload.mode !== "play") return;
+      // Play requests the existing /next catch-up; it does not change the connection state.
+      const roomId = typeof payload.room_id === "string" && payload.room_id ? payload.room_id : null;
+      this.queueEvent({ type: "reconnected", roomId, payload: {} });
+    });
     const stopDropped = this.transport.onDropped?.(() => {
       if (!this.session.isStale(epoch)) {
         this.reportConnection({ connected: false, reason: "dropped" });
@@ -250,6 +256,7 @@ export class BandLink implements AsyncIterable<PlatformEvent> {
     this.session.reconnectObserverTeardown = () => {
       stopReconnected?.();
       stopRejoined?.();
+      stopControl?.();
       stopDropped?.();
     };
 

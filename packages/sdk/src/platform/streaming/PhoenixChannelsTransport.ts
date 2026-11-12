@@ -60,6 +60,7 @@ export class PhoenixChannelsTransport implements StreamingTransport {
   private readonly reconnectObservers = new Set<ReconnectObserver>();
   private readonly topicRejoinObservers = new Set<TopicRejoinObserver>();
   private readonly dropObservers = new Set<DropObserver>();
+  private readonly agentControlObservers = new Set<(payload: Record<string, unknown>) => void>();
   private readonly generationTracker = new ReconnectGenerationTracker(
     (snapshot) => this.notifyReconnectObservers(snapshot),
     (generation, pendingTopics) =>
@@ -348,6 +349,11 @@ export class PhoenixChannelsTransport implements StreamingTransport {
     };
   }
 
+  public onAgentControl(observer: (payload: Record<string, unknown>) => void): () => void {
+    this.agentControlObservers.add(observer);
+    return () => this.agentControlObservers.delete(observer);
+  }
+
   private handleJoinSettled(topic: string, joined: boolean): void {
     // Replies still arriving on a connection being dropped settle nothing; the next socket rejoins.
     if (this.run?.isClosing) {
@@ -464,6 +470,15 @@ export class PhoenixChannelsTransport implements StreamingTransport {
     await this.join(
       topic,
       {
+        "agent.control": (payload) => {
+          for (const observer of this.agentControlObservers) {
+            try {
+              observer(payload);
+            } catch (error) {
+              this.logger.error("Agent control observer failed", { error });
+            }
+          }
+        },
         supersede: (payload) => {
           const reason = parseSupersedeDisconnectReason(payload);
           if (!reason) {
