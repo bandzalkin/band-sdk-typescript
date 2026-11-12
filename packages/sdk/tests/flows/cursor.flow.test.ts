@@ -6,7 +6,7 @@
  */
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
-import { agentControlTopic } from "@band-ai/band-sdk-core";
+import { agentControlTopic, validateEventPayload } from "@band-ai/band-sdk-core";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { CursorACPAdapter, type CursorACPAdapterOptions } from "../../src/adapters/cursor-acp";
@@ -683,7 +683,10 @@ describe("Cursor in a Band room", () => {
 
     const followUp = agent.nextTurn(answering(async () => undefined));
     const waiting = await room.say(OWNER, "Is it done yet?");
-    await platform.transport.emit(agentControlTopic(AGENT_ID), "agent.control", { mode: "play", scope: "room", room_id: room.id });
+    await platform.transport.emit(agentControlTopic(AGENT_ID), "agent.control", validateEventPayload("agent.control", {
+      type: "agent.control", mode: "play", scope: "room", agent_id: AGENT_ID, execution_id: null,
+      room_id: room.id, reason: "user_requested", correlation_id: "play-held-cursor-turn",
+    }) as Record<string, unknown>);
     expect(await room.outcome(await room.say(OWNER, CURSOR_COMMAND))).toBe("processed");
     expect(room.outcomes(waiting), "held while the turn waits on its decision").toEqual([]);
     expect(await room.outcome(await room.say(OWNER, `${CURSOR_COMMAND} answer ${token} mode=plan`))).toBe("processed");

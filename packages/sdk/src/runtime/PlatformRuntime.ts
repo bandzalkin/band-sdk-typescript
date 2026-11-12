@@ -676,7 +676,11 @@ export class PlatformRuntime implements AsyncDisposable {
       }
       if (held) {
         // A decision wait releases the queue, not the turn's write authority or terminal mark.
-        holdRoomUntil(held.then(finish).catch((error: unknown) => {
+        holdRoomUntil(held.then(finish, async (error: unknown) => {
+          succeeded = false;
+          caughtError = error;
+          await finish();
+        }).catch((error: unknown) => {
           if (error instanceof RoomExecutionStoppedError) throw error;
           if (!(error instanceof RecoverableTurnError)) {
             this.logger.error("Held turn settlement failed", { roomId, messageId, error });

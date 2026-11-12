@@ -293,6 +293,13 @@ export class CursorRoomAgent extends ACPRoomAgent {
     }
   }
 
+  public override async cancelTurn(roomId: string): Promise<boolean> {
+    this.cancelRoom(roomId, END_REASON.stopped);
+    // A late native extension request must not attach a fresh decision to this turn.
+    if (this.turn?.roomId === roomId) this.turn = null;
+    return await super.cancelTurn(roomId);
+  }
+
   public override async onCleanup(roomId: string): Promise<void> {
     const turn = this.turn;
     this.cancelRoom(roomId, END_REASON.roomCleanup);

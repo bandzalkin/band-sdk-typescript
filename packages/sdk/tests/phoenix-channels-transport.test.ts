@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { agentControlTopic } from "@band-ai/band-sdk-core";
+import { agentControlTopic, validateEventPayload } from "@band-ai/band-sdk-core";
 
 import { GenericAdapter } from "../src/adapters/GenericAdapter";
 import { RuntimeStateError, TransportError } from "../src/core/errors";
@@ -1169,9 +1169,10 @@ describe("PhoenixChannelsTransport", () => {
       await starting;
       const socket = phoenixMock.FakeSocket.instances[0]!;
       const connects = socket.connectCount;
-      socket.channels.get(agentControlTopic("agent-1"))!.emit("agent.control", {
-        type: "agent.control", mode: "play", scope: "room", agent_id: "agent-1", room_id: room.id,
-      });
+      socket.channels.get(agentControlTopic("agent-1"))!.emit("agent.control", validateEventPayload("agent.control", {
+        type: "agent.control", mode: "play", scope: "room", agent_id: "agent-1", execution_id: null,
+        room_id: room.id, reason: "user_requested", correlation_id: "native-play",
+      }) as Record<string, unknown>);
       await vi.waitFor(() => expect(room.messages.map((message) => message.content)).toEqual(["The queued answer"]));
       expect(await room.outcome(messageId)).toBe("processed");
       expect(socket.connectCount).toBe(connects);

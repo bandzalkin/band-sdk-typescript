@@ -1,9 +1,13 @@
-import { agentControlTopic } from "@band-ai/band-sdk-core";
+import { readFile } from "node:fs/promises";
+import path from "node:path";
+import { agentControlTopic, validateEventPayload } from "@band-ai/band-sdk-core";
 import { BandClient } from "@band-ai/rest-client";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { ACPClientAdapter } from "../../src/adapters/acp/ACPClientAdapter";
 import { CursorACPAdapter } from "../../src/adapters/cursor-acp";
+import { CURSOR_DECISION_MESSAGES } from "../../src/adapters/cursor-acp/messages";
+import { GenericAdapter } from "../../src/adapters/GenericAdapter";
 import { OmpRpcAdapter, type OmpRpcAdapterOptions } from "../../src/adapters/omp-rpc";
 import { Agent } from "../../src/agent/Agent";
 import { FernRestAdapter } from "../../src/client/rest/FernRestAdapter";
@@ -281,7 +285,7 @@ describe("room Stop through the runtime and adapters", () => {
   });
 
   it.each([
-    ["ACP", "room"], ["OMP", "room"], ["ACP", "execution"], ["OMP", "execution"],
+    ["ACP", "room"], ["OMP", "room"], ["ACP", "agent"], ["OMP", "agent"],
   ] as const)("%s replays through the %s Play push without a reconnect or revived old tools", async (protocol, scope) => {
     const provider = protocolPeer(protocol);
     await using session = await runningRoom(provider.adapter, tmpRoot());
@@ -301,11 +305,11 @@ describe("room Stop through the runtime and adapters", () => {
       session.server.stopped.delete(ROOM);
       const replay = provider.next();
       const nextFrom = session.nextRequests.entries.length;
-      await session.platform.transport.emit(agentControlTopic(AGENT_ID), "agent.control", {
+      await session.platform.transport.emit(agentControlTopic(AGENT_ID), "agent.control", validateEventPayload("agent.control", {
         type: "agent.control", mode: "play", scope, agent_id: AGENT_ID,
-        execution_id: scope === "execution" ? "execution-1" : null,
-        room_id: scope === "room" ? ROOM : null,
-      });
+        execution_id: scope === "agent" ? "execution-1" : null,
+        room_id: scope === "room" ? ROOM : null, reason: "user_requested", correlation_id: "play-after-stop",
+      }) as Record<string, unknown>);
       await vi.waitFor(() => expect(session.tools.entries).toHaveLength(2), { timeout: 200 });
       const replayed = await replay;
       const swept = session.nextRequests.entries.slice(nextFrom);
@@ -332,9 +336,10 @@ describe("room Stop through the runtime and adapters", () => {
     const otherId = await otherRoom.say("owner", "Keep this room running too");
     const other = await second;
     try {
-      await session.platform.transport.emit(agentControlTopic(AGENT_ID), "agent.control", {
-        type: "agent.control", mode, scope: "execution", agent_id: AGENT_ID, execution_id: "execution-1", room_id: null,
-      });
+      await session.platform.transport.emit(agentControlTopic(AGENT_ID), "agent.control", validateEventPayload("agent.control", {
+        type: "agent.control", mode, scope: "agent", agent_id: AGENT_ID, execution_id: "execution-1",
+        room_id: null, reason: "user_requested", correlation_id: "ignored-control",
+      }) as Record<string, unknown>);
       await prompt.reply("First answer");
       await prompt.finish();
       await other.reply("Other answer");
@@ -529,5 +534,177 @@ describe("room Stop through the runtime and adapters", () => {
     expect(await session.events.next((event) => event.type === "turn.completed" && event.messageId === messageId)).toMatchObject({ outcome: "stopped", cause: "withdrawal" });
     expect(session.room.posted.slice(beforeStop)).toEqual([]);
     expect(session.room.outcomes(messageId)).toEqual([]);
+  });
+
+  it("journals an accepted post across Stop and deduplicates its operation after Play", async () => {
+    const journalDir = tmpRoot();
+    const results: unknown[] = [];
+    const adapter = new GenericAdapter(async ({ tools }) => {
+      results.push(await tools.executeToolCall("band_send_message", {
+        content: "One durable answer", mentions: ["owner"], operation_id: "accepted-once",
+      }));
+    });
+    await using session = await runningRoom(adapter, journalDir);
+    const accepted = createDeferred();
+    const response = createDeferred();
+    const post = session.platform.rest.createChatMessage.bind(session.platform.rest);
+    let holdResponse = true;
+    session.platform.rest.createChatMessage = async (...args) => {
+      const receipt = await post(...args);
+      if (holdResponse) {
+        holdResponse = false;
+        accepted.resolve();
+        await response.promise;
+      }
+      return receipt;
+    };
+    vi.useFakeTimers();
+    const messageId = await session.room.say("owner", "Answer exactly once");
+    try {
+      await accepted.promise;
+      session.server.stopped.add(ROOM);
+      await vi.advanceTimersByTimeAsync(KEEPALIVE_MS);
+      response.resolve();
+      await session.events.next((event) => event.type === "turn.completed" && event.messageId === messageId);
+      const records = (await readFile(path.join(journalDir, `${ROOM}.jsonl`), "utf8"))
+        .trim().split("\n").map((line) => JSON.parse(line) as { t: string; result?: unknown });
+      const posted = records.find((record) => record.t === "reply.posted");
+      expect(posted, "the accepted receipt must not be reclassified as a failed post").toBeDefined();
+      expect(posted!.result).toEqual(results[0]);
+      expect(records.map((record) => record.t)).not.toContain("reply.failed");
+      expect(session.room.outcomes(messageId)).toEqual([]);
+      await expect(session.tools.entries[0]!.sendMessage("An obsolete second reply", ["owner"]))
+        .rejects.toMatchObject({ name: "RoomExecutionStoppedError" });
+      session.server.stopped.delete(ROOM);
+      await session.platform.transport.emit(agentControlTopic(AGENT_ID), "agent.control", validateEventPayload("agent.control", {
+        type: "agent.control", mode: "play", scope: "room", agent_id: AGENT_ID, execution_id: null,
+        room_id: ROOM, reason: "user_requested", correlation_id: "play-accepted-post",
+      }) as Record<string, unknown>);
+      expect(await session.room.outcome(messageId)).toBe("processed");
+      expect(await session.room.outcome(await session.room.say("owner", "Retry that operation"))).toBe("processed");
+      expect(results).toHaveLength(2);
+      expect(results[1]).toEqual(results[0]);
+      expect(session.room.messages.map((message) => message.content)).toEqual(["One durable answer"]);
+    } finally { response.resolve(); vi.useRealTimers(); }
+  });
+
+  it.each(["question", "plan"] as const)("Stop cancels a pending Cursor %s and invalidates its token after Play", async (kind) => {
+    const acp = new FakeCursorAgent();
+    acp.room(ROOM).lingersOnStop = true;
+    const adapter = new CursorACPAdapter({
+      cwd: tmpRoot(), connectionFactory: acp.connectionFactory, enableMcpTools: false, planMode: "manual",
+    });
+    await using session = await runningRoom(adapter);
+    const result = acp.nextTurn((turn) => kind === "question"
+      ? turn.ask({ questions: [{ id: "mode", options: [{ id: "plan" }] }] })
+      : turn.plan({ title: "A protected plan" }));
+    let answer: unknown = "pending";
+    void result.then((value) => { answer = value; });
+    vi.useFakeTimers();
+    const messageId = await session.room.say("owner", "Ask before continuing");
+    const notice = await session.room.nextMessage((message) => message.content.includes(kind === "question" ? "/cursor answer" : "/cursor accept"));
+    const token = notice.content.match(/\/cursor (?:answer|accept) ([^` ]+)/)![1]!;
+    const beforeStop = session.room.posted.length;
+    try {
+      session.server.stopped.add(ROOM);
+      await vi.advanceTimersByTimeAsync(KEEPALIVE_MS);
+      await vi.waitFor(() => expect(answer).toEqual({ outcome: { outcome: "cancelled" } }), { timeout: 200 });
+      await session.events.next((event) => event.type === "turn.completed" && event.messageId === messageId);
+      expect(session.room.posted.slice(beforeStop)).toEqual([]);
+      expect(session.room.outcomes(messageId)).toEqual([]);
+      const replay = acp.nextTurn((turn) => turn.callTool("band_no_reply", NO_REPLY_ARGS));
+      session.server.stopped.delete(ROOM);
+      await session.platform.transport.emit(agentControlTopic(AGENT_ID), "agent.control", validateEventPayload("agent.control", {
+        type: "agent.control", mode: "play", scope: "room", agent_id: AGENT_ID, execution_id: null,
+        room_id: ROOM, reason: "user_requested", correlation_id: "play-cursor-decision",
+      }) as Record<string, unknown>);
+      await replay;
+      expect(await session.room.outcome(messageId)).toBe("processed");
+      const command = kind === "question" ? `/cursor answer ${token} mode=plan` : `/cursor accept ${token}`;
+      expect(await session.room.exchange("owner", command)).toEqual([CURSOR_DECISION_MESSAGES.notPending(token)]);
+      expect(answer).toEqual({ outcome: { outcome: "cancelled" } });
+    } finally {
+      vi.useRealTimers();
+      await session.agent.rooms.deny(ROOM);
+      await result;
+    }
+  });
+
+  it.each([true, false])("finalizes a rejecting held promise when stopped=%s", async (stopped) => {
+    let rejectEnded!: (error: Error) => void;
+    const ended = new Promise<void>((_resolve, reject) => { rejectEnded = reject; });
+    const entered = createDeferred();
+    let runs = 0;
+    const adapter: FrameworkAdapter = {
+      async onStarted() {},
+      async onCleanup() {},
+      async onEvent(input) {
+        runs++;
+        if (runs === 1) {
+          input.holdRoomUntil!(ended);
+          entered.resolve();
+        } else {
+          await input.tools.sendMessage("Recovered held turn", ["owner"]);
+        }
+      },
+      async cancelTurn() { rejectEnded(new Error("held operation failed")); return true; },
+    };
+    await using session = await runningRoom(adapter);
+    vi.useFakeTimers();
+    const messageId = await session.room.say("owner", "Hold until the operation ends");
+    await entered.promise;
+    if (stopped) {
+      session.server.stopped.add(ROOM);
+      await vi.advanceTimersByTimeAsync(KEEPALIVE_MS);
+    } else {
+      rejectEnded(new Error("held operation failed"));
+    }
+    try {
+      const terminal = () => session.events.entries.filter((event) =>
+        (event.type === "turn.completed" || event.type === "turn.failed") && event.messageId === messageId);
+      await vi.waitFor(() => expect(terminal()).toEqual([expect.objectContaining(stopped
+        ? { type: "turn.completed", outcome: "stopped", cause: "platform" }
+        : { type: "turn.failed", error: "held operation failed" })]), { timeout: 200 });
+      expect(session.room.posted).toEqual([]);
+      if (stopped) {
+        expect(session.room.outcomes(messageId)).toEqual([]);
+        session.server.stopped.delete(ROOM);
+        await session.platform.transport.emit(agentControlTopic(AGENT_ID), "agent.control", validateEventPayload("agent.control", {
+          type: "agent.control", mode: "play", scope: "room", agent_id: AGENT_ID, execution_id: null,
+          room_id: ROOM, reason: "user_requested", correlation_id: "play-rejected-hold",
+        }) as Record<string, unknown>);
+        expect(await session.room.outcome(messageId)).toBe("processed");
+        expect(runs).toBe(2);
+        expect(session.room.messages.map((message) => message.content)).toEqual(["Recovered held turn"]);
+      } else {
+        expect(session.room.outcomes(messageId)).toEqual(["failed"]);
+      }
+    } finally { vi.useRealTimers(); }
+  });
+
+  it("room-scoped Play does not replay a pending inbound in a host-denied room", async () => {
+    const provider = protocolPeer("OMP");
+    await using session = await runningRoom(provider.adapter);
+    expect(await session.agent.rooms.deny(ROOM)).toBe(true);
+    const pending = session.room.postBeforeConnect("owner", "Do not run while denied");
+    const otherRoom = await session.platform.room("room-2");
+    await session.events.next((event) => event.type === "room.joined" && event.roomId === "room-2");
+    const afterDenial = session.nextRequests.entries.length;
+    await session.platform.transport.emit(agentControlTopic(AGENT_ID), "agent.control", validateEventPayload("agent.control", {
+      type: "agent.control", mode: "play", scope: "room", agent_id: AGENT_ID, execution_id: null,
+      room_id: ROOM, reason: "user_requested", correlation_id: "play-denied-room",
+    }) as Record<string, unknown>);
+    const prompted = provider.next("room-2");
+    const otherId = await otherRoom.say("owner", "Observe that the control was consumed");
+    const prompt = await prompted;
+    try {
+      await prompt.reply("Other room still works");
+      await prompt.finish();
+      expect(await otherRoom.outcome(otherId)).toBe("processed");
+      expect(session.room.outcomes(pending)).toEqual([]);
+      expect(session.room.posted).toEqual([]);
+      expect(session.nextRequests.entries.slice(afterDenial)).not.toContain(ROOM);
+      expect(session.tools.entries).toHaveLength(1);
+    } finally { await prompt.finish(); }
   });
 });

@@ -8,6 +8,9 @@
 * **runtime:** keep turns waiting for a decision unprocessed until they actually end.
 * **runtime:** resume pending messages on room- or execution-scoped Play pushes; a missed push waits for the next reconnect.
 * **runtime:** do not report a stopped turn completion when the turn was refused before it started.
+* **runtime:** preserve accepted reply receipts across Stop so an operation retry after Play cannot duplicate the reply.
+* **adapters:** cancel pending Cursor and OpenCode decisions with their turn; old decision tokens cannot approve work after Stop.
+* **runtime:** finalize rejected held operations as stopped or failed instead of leaving the inbound and observer turn unfinished.
 
 
 ## [2.0.0](https://github.com/band-ai/band-sdk-typescript/compare/sdk-v1.0.0...sdk-v2.0.0) (2026-11-09)

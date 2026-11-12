@@ -409,6 +409,29 @@ export class OpencodeAdapter extends SimpleAdapter<OpencodeSessionState, TurnToo
     });
   }
 
+  public async cancelTurn(roomId: string): Promise<boolean> {
+    const roomState = this.rooms.get(roomId);
+    if (!roomState?.turn) return false;
+    const { permissions, questions } = roomState.decisions;
+    const cancelledPermissions = permissions.cancelAll();
+    const cancelledQuestions = questions.cancelAll();
+    const client = this.connection?.client;
+    if (client) {
+      for (const entry of cancelledPermissions) {
+        this.rejectInBackground(roomState, () => client.replyPermission(entry.payload.sessionId, entry.token, {
+          response: REPLY_WORDS.reject, message: REJECTED_PERMISSION_FEEDBACK,
+        }));
+      }
+      for (const entry of cancelledQuestions) {
+        this.rejectInBackground(roomState, () => client.replyQuestion(entry.token, { answers: declinedAnswers(entry.payload.questions) }));
+      }
+    }
+    this.abortAndAbandonSession(roomState);
+    roomState.turn.tools.turn.settle();
+    this.clearTurnState(roomState);
+    return true;
+  }
+
   public async onCleanup(roomId: string): Promise<void> {
     const roomState = this.rooms.get(roomId);
     if (!roomState) {

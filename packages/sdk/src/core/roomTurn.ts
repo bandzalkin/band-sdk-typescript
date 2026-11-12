@@ -96,7 +96,9 @@ export async function roomWrite<T>(roomId: string, write: () => Promise<T>, post
   turn?.assertCurrent();
   try {
     const result = await write();
-    turn?.assertCurrent();
+    // An accepted post is durable evidence: let its caller journal the receipt.
+    // The revoked revision still refuses the turn's next write.
+    if (!post) turn?.assertCurrent();
     return result;
   } catch (error) {
     if (post && isStoppedPost(error)) {
