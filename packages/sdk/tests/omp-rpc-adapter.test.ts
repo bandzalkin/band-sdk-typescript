@@ -316,6 +316,155 @@ describe("OmpRpcAdapter", () => {
     expect(await room.outcome(message)).toBe("processed");
   });
 
+  it("runs a host tool on the child's own gate, with no approval raised anywhere else", async () => {
+    const omp = fakeOmpProcesses();
+    const gates: string[] = [];
+    const permissions: OmpPermissionRequest[] = [];
+    const { room, events } = await startAgent(ompAdapter(omp, {
+      resolvePermission: async (request) => {
+        permissions.push(request);
+        return "Approve";
+      },
+      additionalTools: [
+        {
+          name: "linear__search",
+          description: "Search an authorized server.",
+          inputSchema: { type: "object", properties: { query: { type: "string" } }, required: [] },
+          execute: async () => {
+            gates.push("linear__search");
+            return { content: [{ type: "text", text: "found" }] };
+          },
+        },
+      ],
+    }));
+    const prompted = omp.nextPrompt();
+    const message = await room.say("owner", "search for ada");
+    const { peer, prompt } = await prompted;
+
+    expect(toolText(await peer.callHostTool("tool-1", "linear__search", { query: "ada" }))).toBe("found");
+
+    // The measurement this unit rests on, pinned rather than asserted in prose: OMP raises no
+    // approval of its own for a host tool, so nothing but the tool's own gate stands between a
+    // proxied call and the person's service. A host tool wired into the permission path would
+    // fail all three lines below.
+    expect(gates).toEqual(["linear__search"]);
+    expect(permissions).toEqual([]);
+    expect(ofTypes(events, "approval.requested", "approval.resolved")).toEqual([]);
+
+    peer.send(assistant(text("Ada.")));
+    peer.finish(prompt.id);
+    expect(await room.outcome(message)).toBe("processed");
+  });
+
+  /** A host tool that names the room whose registration build produced it. */
+  function roomProbe(marker: string): McpToolRegistration {
+    return {
+      name: "room_probe",
+      description: "Names the room it was built for.",
+      inputSchema: { type: "object", properties: {}, required: [] },
+      execute: async () => ({ content: [{ type: "text", text: `built-for:${marker}` }] }),
+    };
+  }
+
+  describe("additionalToolsForRoom", () => {
+    it("binds each room's proxied host tool to that room, never to another's", async () => {
+      const omp = fakeOmpProcesses();
+      const built: string[] = [];
+      const { room, otherRoom } = await startAgent(
+        ompAdapter(omp, {
+          additionalToolsForRoom: (roomId: string) => {
+            built.push(roomId);
+            return [roomProbe(roomId)];
+          },
+        }),
+      );
+
+      const promptedA = omp.nextPrompt();
+      const messageA = await room.say("owner", "in room one");
+      const { peer: peerA, prompt: promptA } = await promptedA;
+
+      // Each room runs its own process, so the second one must be awaited by identity: asking for
+      // "the next prompt" without naming a peer would hand back the first room's process again.
+      const peerBSpawned = omp.nextProcess();
+      const messageB = await otherRoom.say("owner", "in room two");
+      const peerB = await peerBSpawned;
+      const promptedB = omp.nextPrompt(peerB);
+      const { prompt: promptB } = await promptedB;
+
+      // The same tool name, answered by two rooms' processes. Each answer has to carry the room whose
+      // build produced it: one shared registration would answer both with whichever room came first.
+      expect(toolText(await peerA.callHostTool("tool-a", "room_probe", {}))).toBe("built-for:room-1");
+      expect(toolText(await peerB.callHostTool("tool-b", "room_probe", {}))).toBe("built-for:room-2");
+      expect(built.sort()).toEqual(["room-1", "room-2"]);
+
+      peerA.send(assistant(text("One.")));
+      peerA.finish(promptA.id);
+      peerB.send(assistant(text("Two.")));
+      peerB.finish(promptB.id);
+      expect(await room.outcome(messageA)).toBe("processed");
+      expect(await otherRoom.outcome(messageB)).toBe("processed");
+    });
+
+    it("refuses to create a room whose own tool collides with a shared one", async () => {
+      const omp = fakeOmpProcesses();
+      const { room } = await startAgent(
+        ompAdapter(omp, {
+          additionalTools: [roomProbe("shared")],
+          additionalToolsForRoom: () => [roomProbe("per-room")],
+        }),
+      );
+
+      let refusal = "";
+      try {
+        const message = await room.say("owner", "hello");
+        refusal = `outcome:${String(await room.outcome(message))}`;
+      } catch (error) {
+        refusal = error instanceof Error ? error.message : String(error);
+      }
+
+      // The collision is refused where the room is made, so the room never gets a process and its turn
+      // cannot run. Without the seam this is unreachable: no per-room set, so no collision, and the
+      // turn processes normally — which is what makes these two lines a test rather than a tautology.
+      expect(refusal).toBe("outcome:failed");
+      expect(omp.peers).toHaveLength(0);
+    });
+  });
+
+  it("refuses a host tool call that arrives after its turn ended, and never reaches the tool", async () => {
+    const omp = fakeOmpProcesses();
+    let reached = 0;
+    const { room } = await startAgent(ompAdapter(omp, {
+      additionalTools: [
+        {
+          name: "band_probe",
+          description: "Records whether it was reached.",
+          inputSchema: { type: "object", properties: {}, required: [] },
+          execute: async () => {
+            reached += 1;
+            return { content: [{ type: "text", text: "probe ran" }] };
+          },
+        },
+      ],
+    }));
+    const prompted = omp.nextPrompt();
+    const message = await room.say("owner", "say hello");
+    const { peer, prompt } = await prompted;
+    peer.send(assistant(text("Hello.")));
+    peer.finish(prompt.id);
+    expect(await room.outcome(message)).toBe("processed");
+
+    // A guard for behaviour that holds today, not a fix. The RPC client answers a host tool call that
+    // arrives with no run in flight (OmpRpcClient.onHostToolCall's `if (!run)`) straight from the
+    // client, without dispatching it: a call that outlived its turn can neither reach a host tool
+    // nor speak in the room. Proven to bite by deleting that branch, which lets the call through to a
+    // dispatch that has no turn to answer on.
+    const late = toolText(await peer.callHostTool("tool-late", "band_probe", {}));
+
+    expect(late).toBe("No turn is running.");
+    expect(reached).toBe(0);
+    expect(room.messages.map((posted) => posted.content)).not.toContain("probe ran");
+  });
+
   it("grants an approval once by default", async () => {
     const omp = fakeOmpProcesses();
     const { room } = await startAgent(ompAdapter(omp));
