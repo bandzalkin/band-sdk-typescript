@@ -108,6 +108,24 @@ export interface ClaudePermissionPrompt extends ClaudePermissionRequest {
 }
 
 /**
+ * Hands over the servers the person authorized at the moment each turn's CLI
+ * process starts, rather than once at construction.
+ *
+ * Called once per generation, before the spawn, and bounded by the adapter's own
+ * deadline (see `AUTHORIZED_SERVERS_TIMEOUT_MS`): a host that is slow, failing or
+ * gone costs that turn its extra servers and never costs it the start. When the
+ * resolver rejects or its bound expires, the adapter logs at warn and the turn
+ * runs with Band's own server alone. The static array form of `extraMcpServers`
+ * needs neither the call nor the bound, and behaves exactly as before.
+ */
+export type ClaudeAuthorizedServersResolver = (
+  signal: AbortSignal,
+) => Promise<readonly McpServer[]>;
+
+/** How long a generation waits for the resolver before starting without them. */
+export const AUTHORIZED_SERVERS_TIMEOUT_MS = 10_000;
+
+/**
  * Why a permission request's `signal` aborted: given up on (`timeout`, the room
  * or adapter stopping, the process failing, the turn cancelled), answered
  * (`settled`), or ended without a usable answer (`no-answer`).
@@ -172,7 +190,7 @@ export interface ClaudeCliAdapterOptions {
    * an entry named like it is dropped. Their tools are never pre-approved: they
    * go through the permission callback like any other tool.
    */
-  extraMcpServers?: readonly McpServer[];
+  extraMcpServers?: readonly McpServer[] | ClaudeAuthorizedServersResolver;
   logger?: Logger;
   /** Starts the CLI process; must start one dedicated to this room's turn. */
   spawnProcess?: ClaudeProcessFactory;
@@ -207,6 +225,12 @@ interface Generation {
   bound: boolean;
   revoked: boolean;
   readonly permissions: Set<AbortController>;
+  /**
+   * Ends the start phase as well as the turn: a generation closed while the
+   * host is still choosing its authorized servers must not sit and wait for an
+   * answer nothing will use.
+   */
+  readonly startAbort: AbortController;
   /** Tool uses this generation has already answered; a second ask is refused. */
   readonly settled: Set<string>;
   endReason: ClaudePermissionEndReason;
@@ -271,7 +295,10 @@ export class ClaudeCliRoomAgent extends SimpleAdapter<ClaudeCliSessionState, Tur
   private readonly permissionTimeoutMs: number;
   private readonly turnTimeoutMs: number;
   private readonly minimumVersion?: string;
-  private readonly extraMcpServers: readonly McpServer[];
+  private readonly extraMcpServers:
+    | readonly McpServer[]
+    | ClaudeAuthorizedServersResolver
+    | undefined;
   private readonly spawnProcess: ClaudeProcessFactory;
   private readonly mcpBackendFactory: typeof createBandMcpBackend;
   private readonly startConfig: ClaudeCliStartConfig;
@@ -283,6 +310,12 @@ export class ClaudeCliRoomAgent extends SimpleAdapter<ClaudeCliSessionState, Tur
   private activeTurn: ActiveTurn | undefined;
   private live: Generation | null = null;
   private starting: Promise<Generation> | null = null;
+  /**
+   * The generation whose start has not finished. A caller cannot await it - that
+   * is the wait being cancelled - so `stop` needs the object itself to release
+   * whatever the start is still sitting on.
+   */
+  private startingGeneration: Generation | null = null;
   /** Bumped by `stop()`, so a start still in flight installs nothing. */
   private generation = 0;
   private started = false;
@@ -315,7 +348,7 @@ export class ClaudeCliRoomAgent extends SimpleAdapter<ClaudeCliSessionState, Tur
     assertTurnTimeoutMs(turnTimeoutMs);
     this.turnTimeoutMs = turnTimeoutMs;
     this.minimumVersion = options.minimumVersion;
-    this.extraMcpServers = options.extraMcpServers ?? [];
+    this.extraMcpServers = options.extraMcpServers;
     this.spawnProcess = options.spawnProcess ?? spawnClaudeProcess;
     this.mcpBackendFactory = options.mcpBackendFactory ?? createBandMcpBackend;
     this.startConfig = options.startConfig ?? {};
@@ -450,6 +483,14 @@ export class ClaudeCliRoomAgent extends SimpleAdapter<ClaudeCliSessionState, Tur
     const generation = this.live;
     this.live = null;
     this.starting = null;
+    // A start in flight is reachable from neither `live` nor this caller's await,
+    // so it is released by hand: whatever it is sitting on - above all the
+    // resolver's bound - belongs to a turn nobody is waiting for any more.
+    const pendingStart = this.startingGeneration;
+    this.startingGeneration = null;
+    if (pendingStart !== null && !pendingStart.startAbort.signal.aborted) {
+      pendingStart.startAbort.abort("adapter-stopped");
+    }
     this.sessionId = null;
     this.owesReplay = true;
     if (generation) await this.retire(generation, "adapter-stopped");
@@ -635,9 +676,11 @@ export class ClaudeCliRoomAgent extends SimpleAdapter<ClaudeCliSessionState, Tur
       bound: false,
       revoked: false,
       permissions: new Set(),
+      startAbort: new AbortController(),
       settled: new Set(),
       endReason: "no-answer",
     };
+    this.startingGeneration = generation;
     let client: ClaudeCliClient | undefined;
     let backend: BandMcpBackend | undefined;
     try {
@@ -667,10 +710,13 @@ export class ClaudeCliRoomAgent extends SimpleAdapter<ClaudeCliSessionState, Tur
           return run();
         },
       });
+      // Resolved here, per generation, so each turn's process carries what the host
+      // can vouch for now - not the bearer the adapter was constructed with.
+      const authorized = await this.resolveAuthorizedServers(generation);
       const url = backendUrl(backend);
       client = await ClaudeCliClient.start(
         this.spawnProcess,
-        { command: this.claudeCommand(url, backend), cwd: this.cwd, env: this.env, logger: this.logger },
+        { command: this.claudeCommand(url, backend, authorized), cwd: this.cwd, env: this.env, logger: this.logger },
         this.startConfig,
       );
       if (generationId !== this.generation) {
@@ -678,6 +724,7 @@ export class ClaudeCliRoomAgent extends SimpleAdapter<ClaudeCliSessionState, Tur
       }
       Object.assign(generation, { client, backend });
       this.live = generation;
+      if (this.startingGeneration === generation) this.startingGeneration = null;
       void client.failed.then(() => {
         // Still live means nothing here retired it: the process failed on its own.
         if (this.live === generation) {
@@ -687,6 +734,7 @@ export class ClaudeCliRoomAgent extends SimpleAdapter<ClaudeCliSessionState, Tur
       });
       return generation;
     } catch (error) {
+      if (this.startingGeneration === generation) this.startingGeneration = null;
       await client?.close({ drainMs: DRAIN_TIMEOUT_MS }).catch((closeError: unknown) => {
         this.logger.warn("claude_cli.close_after_start_failure", { roomId: this.roomId, error: asErrorMessage(closeError) });
       });
@@ -700,11 +748,74 @@ export class ClaudeCliRoomAgent extends SimpleAdapter<ClaudeCliSessionState, Tur
     }
   }
 
+  /**
+   * This generation's authorized servers. A static list is used as given; a
+   * resolver is awaited under its own bound, and any failure - rejection, abort,
+   * or the bound expiring - costs the turn its extra servers alone. The CLI still
+   * starts, because Band's own server does not depend on the resolver.
+   */
+  private async resolveAuthorizedServers(generation: Generation): Promise<readonly McpServer[]> {
+    const configured = this.extraMcpServers;
+    if (configured === undefined) return [];
+    if (typeof configured !== "function") return configured;
+    // Bounded twice on purpose. The generation's own end, so a stop costs this
+    // start nothing at all; and a fixed deadline, so a host that never answers
+    // costs the turn its extra servers alone and never the turn.
+    const controller = new AbortController();
+    const onEnd = (): void => controller.abort("stopped");
+    generation.startAbort.signal.addEventListener("abort", onEnd, { once: true });
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      controller.abort("timeout");
+    }, AUTHORIZED_SERVERS_TIMEOUT_MS);
+    try {
+      const servers = await configured(controller.signal);
+      // The bound ended this, not the host: whether the resolver settled on the way
+      // out or not, an answer that arrives after the deadline is one the turn cannot
+      // vouch for, and the person is owed a line saying the servers went missing.
+      if (timedOut) {
+        this.warnAuthorizedServers("abandoned-at-bound");
+        return [];
+      }
+      // Superseded or closed while the host thought about it: the caller's own
+      // check rejects this start, so hand back nothing rather than a list nobody
+      // will use, and never start a process on an answer nobody asked for again.
+      if (generation.id !== this.generation || generation.revoked) return [];
+      return servers;
+    } catch (error: unknown) {
+      // Only the kind of failure is named, never its message: a token host that
+      // quotes the credential it could not refresh would otherwise put that bearer
+      // in a log line, and a log is not where one belongs.
+      this.warnAuthorizedServers(timedOut ? "abandoned-at-bound" : error instanceof Error ? error.name : "unknown");
+      return [];
+    } finally {
+      clearTimeout(timer);
+      generation.startAbort.signal.removeEventListener("abort", onEnd);
+    }
+  }
+
+  /**
+   * Says a turn is starting without the person's servers. Fixed words only: no
+   * server name, no URL, no host text. Whatever failed, the reason the host gave
+   * may itself be a credential, and a log line is not where one belongs.
+   */
+  private warnAuthorizedServers(cause: string): void {
+    this.logger.warn("claude_cli.authorized_servers_failed", {
+      roomId: this.roomId,
+      cause,
+    });
+  }
+
   /** The CLI's argv: the transport flags, then the session's policy, then the host's. */
-  private claudeCommand(bandUrl: string, backend: BandMcpBackend): string[] {
+  private claudeCommand(
+    bandUrl: string,
+    backend: BandMcpBackend,
+    authorizedServers: readonly McpServer[],
+  ): string[] {
     const config = encodeMcpConfig(
       { type: "http", url: bandUrl, headers: { Authorization: `Bearer ${backend.authToken ?? ""}` } },
-      this.extraMcpServers,
+      authorizedServers,
     );
     const args = [
       ...this.command,
@@ -868,10 +979,12 @@ export class ClaudeCliRoomAgent extends SimpleAdapter<ClaudeCliSessionState, Tur
   private revoke(generation: Generation, reason: ClaudePermissionEndReason): void {
     generation.revoked = true;
     generation.endReason = reason;
+    if (!generation.startAbort.signal.aborted) generation.startAbort.abort(reason);
   }
 
   private endPermissions(generation: Generation, reason: ClaudePermissionEndReason): void {
     generation.endReason = reason;
+    if (!generation.startAbort.signal.aborted) generation.startAbort.abort(reason);
     for (const controller of generation.permissions) {
       if (!controller.signal.aborted) controller.abort(reason);
     }

@@ -7,6 +7,10 @@ import { MCP_SERVER_NAME } from "../src/contracts/toolSchemas";
 import { createDeferred } from "../src/core/deferred";
 import { Agent } from "../src/agent/Agent";
 import { ClaudeCliAdapter, DENIED_CLAUDE_CLI_TOOLS, validateClaudeArgs } from "../src/adapters/claude-cli";
+import {
+  AUTHORIZED_SERVERS_TIMEOUT_MS,
+  type ClaudeAuthorizedServersResolver,
+} from "../src/adapters/claude-cli";
 import type { ClaudeCliAdapterOptions, ClaudePermissionDecision } from "../src/adapters/claude-cli";
 import { ValidationError } from "../src/core/errors";
 import { BandLink } from "../src/platform/BandLink";
@@ -1007,6 +1011,128 @@ describe("ClaudeCliAdapter", () => {
     }
   });
 
+  it("asks the host for its authorized servers when each generation starts", async () => {
+    // Construction must not capture the servers: a bearer minted at construction is a
+    // bearer that goes stale inside the process, and every turn starts a new process.
+    const rigged = rig();
+    let calls = 0;
+    const resolve: ClaudeAuthorizedServersResolver = async () => {
+      calls += 1;
+      return [
+        {
+          name: `linear-${calls}`,
+          type: "http",
+          url: `https://mcp.linear.test/${calls}`,
+          headers: [{ name: "Authorization", value: `Bearer turn-${calls}` }],
+        },
+      ];
+    };
+    const claude = adapter(rigged, { extraMcpServers: resolve });
+    const { agent, room, platform } = await started(claude);
+    try {
+      expect(calls).toBe(0);
+      const other = await platform.room(OTHER_ROOM);
+      useSession(SESSION_DEFAULT);
+      const firstDone = turnSettled(agent);
+      const first = room.say("owner", "one");
+      const peerOne = await rigged.nextPeer();
+      expect(calls).toBe(1);
+      expect(Object.keys(mcpConfig(peerOne).mcpServers)).toEqual(["linear-1", MCP_SERVER_NAME]);
+      expect(mcpConfig(peerOne).mcpServers["linear-1"]?.headers?.Authorization).toBe("Bearer turn-1");
+      await waitForPrompt(peerOne);
+      useSession("SESSION-A");
+      await peerOne.scriptTurn(systemInit("SESSION-A"), assistant(text("reply a")), result({ result: "reply a", session_id: "SESSION-A" }));
+      await first;
+      await firstDone;
+
+      // The room's next turn is a new process, so it asks again and gets the value the
+      // host can vouch for now - not the one the first process was started with.
+      const secondDone = turnSettled(agent);
+      const second = other.say("owner", "two");
+      const peerTwo = await rigged.nextPeer();
+      expect(calls).toBe(2);
+      expect(Object.keys(mcpConfig(peerTwo).mcpServers)).toEqual(["linear-2", MCP_SERVER_NAME]);
+      expect(mcpConfig(peerTwo).mcpServers["linear-2"]?.headers?.Authorization).toBe("Bearer turn-2");
+      await waitForPrompt(peerTwo);
+      useSession("SESSION-B");
+      await peerTwo.scriptTurn(systemInit("SESSION-B"), assistant(text("reply b")), result({ result: "reply b", session_id: "SESSION-B" }));
+      await second;
+      await secondDone;
+    } finally {
+      await agent.stop();
+    }
+  });
+
+  it("starts the turn without the extra servers when the host cannot name them", async () => {
+    const rigged = rig();
+    const logged: string[] = [];
+    const logger = {
+      debug: () => undefined,
+      info: () => undefined,
+      warn: (event: string) => logged.push(event),
+      error: () => undefined,
+    } as unknown as ClaudeCliAdapterOptions["logger"];
+    const claude = adapter(rigged, {
+      extraMcpServers: async () => {
+        throw new Error("token host down");
+      },
+      logger,
+    });
+    const { agent, room } = await started(claude);
+    try {
+      const done = turnSettled(agent);
+      const said = room.say("owner", "one");
+      const peer = await rigged.nextPeer();
+      // A refused grant costs the turn its extra servers alone: Band's own server is
+      // there, the CLI starts, and the reply lands.
+      expect(Object.keys(mcpConfig(peer).mcpServers)).toEqual([MCP_SERVER_NAME]);
+      await peer.scriptTurn(systemInit(), assistant(text("ok")), result({ result: "ok" }));
+      await said;
+      await done;
+      expect(logged).toContain("claude_cli.authorized_servers_failed");
+      expect(room.messages.map((message) => message.content)).toEqual(["ok"]);
+    } finally {
+      await agent.stop();
+    }
+  });
+
+  it("does not let a host that never answers cost the turn its start", async () => {
+    const rigged = rig();
+    const logged: string[] = [];
+    const logger = {
+      debug: () => undefined,
+      info: () => undefined,
+      warn: (event: string) => logged.push(event),
+      error: () => undefined,
+    } as unknown as ClaudeCliAdapterOptions["logger"];
+    const claude = adapter(rigged, {
+      // An answer that never arrives: the resolver's own bound, not the turn's
+      // lifetime, has to be what releases the spawn.
+      extraMcpServers: (signal) =>
+        new Promise((resolve, reject) => {
+          signal.addEventListener("abort", () => reject(new Error("aborted at the bound")), {
+            once: true,
+          });
+        }),
+      logger,
+    });
+    const { agent, room } = await started(claude);
+    try {
+      const startedAt = Date.now();
+      const done = turnSettled(agent);
+      const said = room.say("owner", "one");
+      const peer = await rigged.nextPeer();
+      expect(Date.now() - startedAt).toBeLessThan(AUTHORIZED_SERVERS_TIMEOUT_MS + 5_000);
+      expect(Object.keys(mcpConfig(peer).mcpServers)).toEqual([MCP_SERVER_NAME]);
+      await peer.scriptTurn(systemInit(), assistant(text("ok")), result({ result: "ok" }));
+      await said;
+      await done;
+      expect(logged).toContain("claude_cli.authorized_servers_failed");
+    } finally {
+      await agent.stop();
+    }
+  }, AUTHORIZED_SERVERS_TIMEOUT_MS + 30_000);
+
   it("gives two rooms their own process, session and tools", async () => {
     const rigged = rig();
     const claude = adapter(rigged);
@@ -1122,6 +1248,122 @@ describe("ClaudeCliAdapter", () => {
       await agent.stop();
     }
   });
+});
+
+describe("ClaudeCliAdapter authorized-servers resolver hardening", () => {
+  const github = (token = "resolver-bearer") => ({
+    name: "github",
+    type: "http" as const,
+    url: "https://mcp.github.test/mcp",
+    headers: [{ name: "Authorization", value: `Bearer ${token}` }],
+  });
+
+  function capturingLogger(): {
+    logger: ClaudeCliAdapterOptions["logger"];
+    warns: { event: string; context?: Record<string, unknown> }[];
+  } {
+    const warns: { event: string; context?: Record<string, unknown> }[] = [];
+    return {
+      warns,
+      logger: {
+        debug: () => undefined,
+        info: () => undefined,
+        warn: (event: string, context?: Record<string, unknown>) => {
+          warns.push({ event, context });
+        },
+        error: () => undefined,
+      } as unknown as ClaudeCliAdapterOptions["logger"],
+    };
+  }
+
+  /** One turn, end to end: the ask, the process that served it, the reply read back. */
+  async function runTurn(
+    agent: Agent,
+    room: Awaited<ReturnType<typeof started>>["room"],
+    rigged: ReturnType<typeof rig>,
+  ): Promise<FakeClaude> {
+    const done = turnSettled(agent);
+    const said = room.say("owner", "one");
+    const peer = await rigged.nextPeer();
+    await peer.scriptTurn(systemInit(), assistant(text("ok")), result({ result: "ok" }));
+    await said;
+    await done;
+    return peer;
+  }
+
+  it("offers a resolved server to the CLI without ever pre-approving its tools", async () => {
+    const rigged = rig();
+    const claude = adapter(rigged, {
+      allowedTools: ["Bash"],
+      extraMcpServers: async () => [github()],
+    });
+    const { agent, room } = await started(claude);
+    try {
+      const peer = await runTurn(agent, room, rigged);
+
+      // The server is offered, Band's own still appended last...
+      expect(Object.keys(mcpConfig(peer).mcpServers)).toEqual(["github", MCP_SERVER_NAME]);
+      // ...and nothing about it is pre-approved. A resolver must not be a way to
+      // hand the CLI permission to reach the person's services without asking.
+      const approved = approvedTools(peer);
+      expect(approved).toContain("Bash");
+      expect(approved.some((name) => name.startsWith("mcp__github__"))).toBe(false);
+      expect(approved.filter((name) => name.includes("github"))).toEqual([]);
+    } finally {
+      await agent.stop();
+    }
+  });
+
+  it("says so when its own bound released a resolver that settled quietly", async () => {
+    const rigged = rig();
+    const { logger, warns } = capturingLogger();
+    const claude = adapter(rigged, {
+      // Not a failure: a host that waits to be told to stop and then answers with
+      // an empty list. The deadline is the only thing that can report this, and an
+      // agent running without servers the person authorized is not a silence.
+      extraMcpServers: (signal) =>
+        new Promise((resolve) => {
+          signal.addEventListener("abort", () => resolve([]), { once: true });
+        }),
+      logger,
+    });
+    const { agent, room } = await started(claude);
+    try {
+      const peer = await runTurn(agent, room, rigged);
+      expect(Object.keys(mcpConfig(peer).mcpServers)).toEqual([MCP_SERVER_NAME]);
+      expect(warns.map(({ event }) => event)).toContain("claude_cli.authorized_servers_failed");
+    } finally {
+      await agent.stop();
+    }
+  }, AUTHORIZED_SERVERS_TIMEOUT_MS + 30_000);
+
+  it("keeps what the host said, and every credential inside it, out of the log line", async () => {
+    const rigged = rig();
+    const { logger, warns } = capturingLogger();
+    const claude = adapter(rigged, {
+      extraMcpServers: async () => {
+        throw new Error(
+          "refresh rejected for https://mcp.github.test/mcp: Bearer SUPER-SECRET-BEARER-VALUE expired",
+        );
+      },
+      logger,
+    });
+    const { agent, room } = await started(claude);
+    try {
+      await runTurn(agent, room, rigged);
+      expect(warns.map(({ event }) => event)).toContain("claude_cli.authorized_servers_failed");
+      // The name of the failure is reported; its words are not. A host that quotes
+      // the credential it could not refresh would otherwise put that bearer in a
+      // log, and logs are copied into bug reports and terminals.
+      const line = JSON.stringify(warns);
+      expect(line).not.toContain("SUPER-SECRET-BEARER-VALUE");
+      expect(line).not.toContain("mcp.github.test");
+      expect(line).not.toContain("refresh rejected for");
+    } finally {
+      await agent.stop();
+    }
+  });
+
 });
 
 const CONTRACT_TURNS: Record<TurnScript, (peer: FakeClaude, tool?: { name: string }) => Promise<void>> = {
