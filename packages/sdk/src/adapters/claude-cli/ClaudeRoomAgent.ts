@@ -82,7 +82,23 @@ export const RESERVED_CLAUDE_FLAGS = [
   "--allow-dangerously-skip-permissions",
   "--permission-mode",
   "--tools",
+  // The adapter is the only writer of the settings document: its ask rules for
+  // authorized servers under auto must not be replaceable by host arguments.
+  "--settings",
 ] as const;
+
+/**
+ * A server name the CLI's rule matcher can be given meaningfully: the ask rule
+ * for `mcp__<name>__*` is only as trustworthy as the name's character set. Any
+ * other name cannot be force-asked, so the server cannot be trusted to ask on
+ * its own, and an unaskable authorized server never reaches the CLI at all.
+ */
+const AUTHORIZED_SERVER_NAME = /^[A-Za-z0-9._:@-]+$/u;
+
+/** The CLI's `permissions.ask` entry pinning one authorized server's tools to a prompt. */
+function authorizedAskRule(name: string): string {
+  return `mcp__${name}__*`;
+}
 
 const DEFAULT_PERMISSION_TIMEOUT_MS = 5 * 60_000;
 const DEFAULT_TURN_TIMEOUT_MS = 60 * 60_000;
@@ -159,8 +175,14 @@ export interface ClaudeCliAdapterOptions {
   customSection?: string;
   model?: string;
   effort?: "low" | "medium" | "high" | "xhigh" | "max";
-  /** The CLI's own permission mode. `manual` is accepted and mapped to `default`. */
-  permissionMode?: "default" | "acceptEdits" | "plan" | "dontAsk" | "manual";
+  /**
+   * The CLI's own permission mode. `manual` is accepted and mapped to `default`.
+   * `auto` asks nothing of the room for native tools — the CLI reviews them — so
+   * a room started with it keeps one promise by force: every tool of every
+   * person-authorized server is pinned to ask through the room's Approve with a
+   * `permissions.ask` rule the CLI itself honours under auto (measured on 2.1.319).
+   */
+  permissionMode?: "default" | "acceptEdits" | "plan" | "dontAsk" | "manual" | "auto";
   /** Directories or archives the CLI loads as plugins for this session. */
   pluginDirs?: string[];
   /** Tools the CLI may use without asking, in the CLI's own rule syntax. */
@@ -557,8 +579,10 @@ export class ClaudeCliRoomAgent extends SimpleAdapter<ClaudeCliSessionState, Tur
       rethrowIfRecoverableTurnFailure(error);
       if (!generation) {
         // A process that finished starting for a turn that already ended must
-        // not sit beside the room's next one.
-        void pending.then((started) => this.close(started));
+        // not sit beside the room's next one. This branch waits for the process
+        // only to close it; the turn's own error is the one already in hand, so
+        // the rejection gets a handler rather than becoming an unowned one.
+        void pending.then((started) => this.close(started), () => undefined);
       }
       if (error instanceof ClaudeTurnCancelledError) {
         // A host's cancel ends the turn quietly: what the model produced is
@@ -721,6 +745,23 @@ export class ClaudeCliRoomAgent extends SimpleAdapter<ClaudeCliSessionState, Tur
       if (generationId !== this.generation) {
         throw new Error(START_SUPERSEDED);
       }
+      // The mode a person chose is never quietly another mode: when the session
+      // asked for one, the CLI's own `initialize` report must name it back. A
+      // missing report is as untrustworthy as a mismatched one — both would let
+      // the room run on an approval floor nobody confirmed, and a silent fallback
+      // is exactly what the person is owed a reason for instead.
+      const requestedMode = this.permissionMode;
+      if (requestedMode) {
+        const honoured = requestedMode === "manual" ? "default" : requestedMode;
+        const reported = client.initReport?.permissionMode ?? null;
+        if (reported !== honoured) {
+          throw new ClaudeProcessError(
+            reported === null
+              ? `the Claude CLI did not report a permission mode for the requested ${honoured}`
+              : `the Claude CLI started in permission mode ${reported} instead of the requested ${honoured}`,
+          );
+        }
+      }
       Object.assign(generation, { client, backend });
       this.live = generation;
       if (this.startingGeneration === generation) this.startingGeneration = null;
@@ -812,9 +853,22 @@ export class ClaudeCliRoomAgent extends SimpleAdapter<ClaudeCliSessionState, Tur
     backend: BandMcpBackend,
     authorizedServers: readonly McpServer[],
   ): string[] {
+    // An authorized server whose name cannot be given a trustworthy ask rule is
+    // dropped in every mode, not just auto: a server the room cannot force to ask
+    // is a server the room must not hand the CLI at all. Counted in the log, never
+    // named — same doctrine as a failed token host.
+    const askable = authorizedServers.filter(
+      (server) => typeof server?.name === "string" && AUTHORIZED_SERVER_NAME.test(server.name.trim()),
+    );
+    if (askable.length !== authorizedServers.length) {
+      this.logger.warn("claude_cli.authorized_server_name_unaskable", {
+        roomId: this.roomId,
+        dropped: authorizedServers.length - askable.length,
+      });
+    }
     const config = encodeMcpConfig(
       { type: "http", url: bandUrl, headers: { Authorization: `Bearer ${backend.authToken ?? ""}` } },
-      authorizedServers,
+      askable,
     );
     const args = [
       ...this.command,
@@ -859,6 +913,14 @@ export class ClaudeCliRoomAgent extends SimpleAdapter<ClaudeCliSessionState, Tur
       args.push("--allowedTools", ...approved);
     }
     args.push("--disallowedTools", ...DENIED_CLAUDE_CLI_TOOLS);
+    // Under auto the CLI reviews native tools itself and asks the room nothing.
+    // The person's authorized servers are the one class that must keep asking —
+    // every call to one still reaches the room's Approve. The ask rules below are
+    // how that is forced; the CLI honours them under auto (measured on 2.1.319).
+    if (this.permissionMode === "auto" && askable.length > 0) {
+      const ask = askable.map((server) => authorizedAskRule(server.name.trim()));
+      args.push("--settings", JSON.stringify({ permissions: { ask } }));
+    }
     return args;
   }
 

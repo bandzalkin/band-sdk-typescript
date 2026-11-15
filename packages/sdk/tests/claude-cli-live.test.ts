@@ -7,7 +7,8 @@ import { tmpdir } from "node:os";
 
 import { Agent } from "../src/agent/Agent";
 import { BandLink } from "../src/platform/BandLink";
-import { ClaudeCliAdapter, type ClaudePermissionDecision, type ClaudePermissionPrompt } from "../src/adapters/claude-cli";
+import { BandMcpServer } from "../src/mcp/server";
+import { ClaudeCliAdapter, type ClaudeCliAdapterOptions, type ClaudePermissionDecision, type ClaudePermissionPrompt } from "../src/adapters/claude-cli";
 import type { ClaudeExitInfo, ClaudeProcessOptions } from "../src/adapters/claude-cli/client";
 import type { AgentEvent } from "../src/contracts/events";
 import { AGENT_API_KEY, AGENT_ID, BandPlatform, person } from "./flows/support/bandPlatform";
@@ -43,15 +44,15 @@ interface Live {
   turnEnd: () => Promise<AgentEvent>;
 }
 
-async function liveOrReport(): Promise<Live> {
+async function liveOrReport(options: Partial<ClaudeCliAdapterOptions> = {}): Promise<Live> {
   const reason = await unavailable();
   if (reason) {
     throw new Error(`UNAVAILABLE: the real-CLI check could not run - ${reason}`);
   }
-  return live();
+  return live(options);
 }
 
-async function live(): Promise<Live> {
+async function live(options: Partial<ClaudeCliAdapterOptions> = {}): Promise<Live> {
   const platform = BandPlatform.host([person("owner")]);
   const room = await platform.room(ROOM);
   const launches: string[][] = [];
@@ -88,11 +89,14 @@ async function live(): Promise<Live> {
     };
   };
   const claude = new ClaudeCliAdapter({
-    cwd: tmpRoot(),
+    // The caller may name a workspace of its own; cwd and workspaceForRoom cannot
+    // combine, so the default root goes away exactly when the caller supplies one.
+    ...(options.workspaceForRoom === undefined ? { cwd: tmpRoot() } : {}),
     command: [CLAUDE_BIN],
     spawnProcess,
     permissionTimeoutMs: 120_000,
     turnTimeoutMs: 180_000,
+    ...options,
     resolvePermission: (prompt, signal) =>
       new Promise<ClaudePermissionDecision | undefined>((resolve) => {
         prompts.push(prompt);
@@ -383,6 +387,86 @@ describe.skipIf(!LIVE)("Claude CLI adapter against the installed CLI", () => {
       rmSync(probeDir, { recursive: true, force: true });
     }
   }, 180_000);
+
+  it("auto runs a workspace edit without asking the room", async () => {
+    const ws = mkdtempSync(join(tmpdir(), "band-live-auto-edit-"));
+    const target = join(ws, "written-by-auto.txt");
+    const run = await liveOrReport({ permissionMode: "auto", workspaceForRoom: () => ws });
+    try {
+      const ended = run.turnEnd();
+      const posted = run.room.say("owner", `Use the Write tool exactly once to create ${target} with content AUTO-OK. Then reply with the single word DONE.`);
+      await posted;
+      const end = await ended;
+      expect(end.type, `the auto turn did not complete: ${record(run)}`).toBe("turn.completed");
+      expect(run.prompts, `auto asked the room about a workspace edit: ${record(run)}`).toEqual([]);
+      expect(existsSync(target), `auto did not run the edit: ${record(run)}`).toBe(true);
+    } finally {
+      await run.agent.stop();
+      rmSync(ws, { recursive: true, force: true });
+    }
+  }, 180_000);
+
+  it("auto still brings a person-authorized server call to the room", async () => {
+    // The adapter's promise behind offering auto: the CLI reviews native tools
+    // itself, but every tool of every authorized server stays pinned to the room's
+    // Approve by an ask rule (measured on 2.1.319). The marker proves the call ran;
+    // the prompt proves it asked first.
+    const server = new BandMcpServer({
+      name: "granted-live",
+      tools: () => undefined,
+      additionalTools: [
+        {
+          name: "probe_fetch",
+          description: "Returns a fixed marker. Proves the authorized-server path.",
+          inputSchema: { type: "object", properties: { q: { type: "string" } }, required: ["q"] },
+          execute: async (args: Record<string, unknown>) => ({
+            content: [{ type: "text", text: `GRANTED-MARK-${String(args["q"] ?? "?")}` }],
+          }),
+        },
+      ],
+    });
+    await server.start();
+    const ws = mkdtempSync(join(tmpdir(), "band-live-auto-granted-"));
+    const run = await liveOrReport({
+      permissionMode: "auto",
+      workspaceForRoom: () => ws,
+      extraMcpServers: [
+        {
+          name: "granted",
+          type: "http",
+          url: server.url!,
+          headers: [{ name: "Authorization", value: "Bearer live-probe-token" }],
+        },
+      ],
+    });
+    try {
+      const ended = run.turnEnd();
+      const posted = run.room.say("owner", 'Call the tool named mcp__granted__probe_fetch exactly once with argument {"q":"live"}. It answers a short marker string; that is expected. Then reply with the single word DONE.');
+      const prompt = await run.askedOrEnded();
+      if (!prompt) {
+        throw new Error(`NO ASK: auto ran the authorized-server call without the room: ${record(run)}`);
+      }
+      expect(prompt.toolName, `the room was asked about ${prompt.toolName}, not the authorized server`).toContain("granted");
+      // The pinning itself must be on the command line, not merely observed.
+      const command = (run.launches[0] ?? []).join(" ");
+      expect(command, `auto was not passed to the CLI: ${command}`).toContain("--permission-mode auto");
+      const settingsIndex = (run.launches[0] ?? []).indexOf("--settings");
+      expect(settingsIndex, `no settings document pinned the authorized server: ${command}`).toBeGreaterThan(-1);
+      const settings = JSON.parse(run.launches[0]![settingsIndex + 1]!) as { permissions?: { ask?: string[] } };
+      expect(settings.permissions?.ask, `the authorized server was not pinned to ask: ${JSON.stringify(settings)}`).toContain("mcp__granted__*");
+      run.decide({ behavior: "allow", updatedInput: (prompt.input ?? {}) as Record<string, unknown> });
+      await posted;
+      await ended;
+      expect(
+        JSON.stringify(run.room.events("tool_result")),
+        `the authorized call never reached the fixture server: ${record(run)}`,
+      ).toContain("GRANTED-MARK-live");
+    } finally {
+      await run.agent.stop();
+      await server.stop();
+      rmSync(ws, { recursive: true, force: true });
+    }
+  }, 240_000);
 
   it("reports the files a probe left behind, so a failure can be read", async () => {
     const leftovers = readdirSync(tmpdir()).filter((name) => name.startsWith("band-approval-") || name.startsWith("band-stop-"));

@@ -92,7 +92,11 @@ function rig(onSpawn?: (peer: FakeClaude) => void) {
         const requestId = String(request.request_id);
         answered.add(requestId);
         const subtype = (request.request as { subtype?: string } | undefined)?.subtype;
-        peer.send(subtype === "initialize" ? initResponse(requestId) : controlSuccess(requestId));
+        // A real CLI names back the mode it was launched with; the fake echoes the
+        // argv, so a test that asks for a mode is answered with that mode unless it
+        // scripts the response itself.
+        const echoed = argPair(peer.options.command, "--permission-mode") ?? "default";
+        peer.send(subtype === "initialize" ? initResponse(requestId, "2.1.319", echoed) : controlSuccess(requestId));
         answerNextRequest();
       });
     };
@@ -954,10 +958,138 @@ describe("ClaudeCliAdapter", () => {
     }
   });
 
+  it("passes auto through and pins every authorized server to the room's prompt with an ask rule", async () => {
+    const rigged = fakeClaudeProcesses();
+    const claude = adapter(rigged, {
+      permissionMode: "auto",
+      extraMcpServers: [
+        { name: "granted", type: "http", url: "https://granted.test/mcp", headers: [{ name: "Authorization", value: "Bearer granted-token" }] },
+      ],
+    });
+    const { agent, room } = await started(claude);
+    try {
+      const promptedDone = turnSettled(agent);
+      const prompted = room.say("owner", "one");
+      const peer = await rigged.nextPeer();
+      expect(argPair(peer.options.command, "--permission-mode"), "auto must reach the CLI as its own name").toBe("auto");
+      const settings = JSON.parse(argPair(peer.options.command, "--settings") ?? "null") as { permissions?: { ask?: string[] } } | null;
+      expect(settings?.permissions?.ask, "authorized servers are pinned to ask under auto").toEqual(["mcp__granted__*"]);
+      expect(Object.keys(mcpConfig(peer).mcpServers)).toEqual(["granted", "band"]);
+      peer.send(initResponse(String((await peer.controlRequest("initialize")).request_id), "2.1.319", "auto"));
+      await peer.scriptTurn(systemInit(), assistant(text("ok")), result({ result: "ok" }));
+      await prompted;
+      await promptedDone;
+    } finally {
+      await agent.stop();
+    }
+  });
+
+  for (const permissionMode of ["manual", "auto"] as const) {
+    it(`drops an authorized server whose name cannot be given a trustworthy ask rule (${permissionMode})`, async () => {
+      const rigged = fakeClaudeProcesses();
+      const claude = adapter(rigged, {
+        permissionMode,
+        extraMcpServers: [
+          { name: "granted", type: "http", url: "https://granted.test/mcp", headers: [] },
+          { name: "weird name!", type: "http", url: "https://weird.test/mcp", headers: [] },
+        ],
+      });
+      const { agent, room } = await started(claude);
+      try {
+        const promptedDone = turnSettled(agent);
+        const prompted = room.say("owner", "one");
+        const peer = await rigged.nextPeer();
+        // An unaskable server never reaches the CLI in any mode: the room cannot
+        // force it to ask, so it must not be present when auto asks nothing.
+        expect(Object.keys(mcpConfig(peer).mcpServers)).toEqual(["granted", "band"]);
+        const settings = argPair(peer.options.command, "--settings");
+        if (permissionMode === "auto") {
+          expect(JSON.parse(settings ?? "null")).toEqual({ permissions: { ask: ["mcp__granted__*"] } });
+        } else {
+          expect(settings, "only auto needs the ask rules; other modes keep asking by themselves").toBeUndefined();
+        }
+        peer.send(initResponse(String((await peer.controlRequest("initialize")).request_id), "2.1.319", permissionMode === "manual" ? "default" : "auto"));
+        await peer.scriptTurn(systemInit(), assistant(text("ok")), result({ result: "ok" }));
+        await prompted;
+        await promptedDone;
+      } finally {
+        await agent.stop();
+      }
+    });
+  }
+
+  it("writes no settings document when auto has no authorized server to pin", async () => {
+    const rigged = fakeClaudeProcesses();
+    const claude = adapter(rigged, { permissionMode: "auto" });
+    const { agent, room } = await started(claude);
+    try {
+      const promptedDone = turnSettled(agent);
+      const prompted = room.say("owner", "one");
+      const peer = await rigged.nextPeer();
+      expect(argPair(peer.options.command, "--permission-mode")).toBe("auto");
+      expect(argPair(peer.options.command, "--settings"), "nothing to pin, nothing to declare").toBeUndefined();
+      peer.send(initResponse(String((await peer.controlRequest("initialize")).request_id), "2.1.319", "auto"));
+      await peer.scriptTurn(systemInit(), assistant(text("ok")), result({ result: "ok" }));
+      await prompted;
+      await promptedDone;
+    } finally {
+      await agent.stop();
+    }
+  });
+
+  it("refuses the room when the CLI starts in a mode other than the one asked for", async () => {
+    const rigged = fakeClaudeProcesses();
+    const claude = adapter(rigged, { permissionMode: "auto" });
+    const { agent, room, events } = await started(claude);
+    try {
+      const promptedDone = turnSettled(agent);
+      const prompted = room.say("owner", "one");
+      const peer = await rigged.nextPeer();
+      // The person asked for auto; this process answers that it runs as default.
+      // Never a quiet substitution: the turn must not reach the model.
+      peer.send(initResponse(String((await peer.controlRequest("initialize")).request_id), "2.1.319", "default"));
+      await prompted;
+      const end = await promptedDone;
+      expect(end.type).toBe("turn.failed");
+      expect(
+        events.some((event) => event.type === "room.failed" && JSON.stringify(event).includes("started in permission mode default instead of the requested auto")),
+        `the person is owed the reason: ${JSON.stringify(events.map((event) => event.type))}`,
+      ).toBe(true);
+      expect(room.messages.map((message) => message.content)).toEqual([]);
+    } finally {
+      await agent.stop();
+    }
+  });
+
+  it("refuses the room when the CLI reports no mode at all for the one asked for", async () => {
+    const rigged = fakeClaudeProcesses();
+    const claude = adapter(rigged, { permissionMode: "auto" });
+    const { agent, room, events } = await started(claude);
+    try {
+      const promptedDone = turnSettled(agent);
+      const prompted = room.say("owner", "one");
+      const peer = await rigged.nextPeer();
+      peer.send(initResponse(String((await peer.controlRequest("initialize")).request_id), "2.1.319", null));
+      await prompted;
+      const end = await promptedDone;
+      expect(end.type).toBe("turn.failed");
+      expect(
+        events.some((event) => event.type === "room.failed" && JSON.stringify(event).includes("did not report a permission mode")),
+        `an unconfirmed mode is as untrustworthy as a wrong one: ${JSON.stringify(events.map((event) => event.type))}`,
+      ).toBe(true);
+    } finally {
+      await agent.stop();
+    }
+  });
+
   it("refuses a custom argument that would override a flag the transport owns", () => {
     expect(() => validateClaudeArgs(["--permission-prompt-tool", "mcp__evil__gate"])).toThrow(ValidationError);
     expect(() => validateClaudeArgs(["--setting-sources=user,project"])).toThrow(/reserved/);
     expect(() => validateClaudeArgs(["--no-session-persistence"])).toThrow(/reserved/);
+    // The adapter is the only writer of the settings document: its ask rules for
+    // authorized servers under auto cannot be replaced from the host side.
+    expect(() => validateClaudeArgs(["--settings", "{}"])).toThrow(/reserved/);
+    expect(() => new ClaudeCliAdapter({ command: ["claude", "--settings", '{"permissions":{"ask":[]}}'] })).toThrow(ValidationError);
     expect(validateClaudeArgs(["--include-partial-messages"])).toEqual(["--include-partial-messages"]);
     expect(() => new ClaudeCliAdapter({ command: ["claude", "--dangerously-skip-permissions"] })).toThrow(ValidationError);
   });
