@@ -958,7 +958,13 @@ describe("ClaudeCliAdapter", () => {
     }
   });
 
-  it("passes auto through and pins every authorized server to the room's prompt with an ask rule", async () => {
+  it("passes auto through and never forces asks with a settings document", async () => {
+    // Owner decision 2026-11-15: under auto the CLI's own risk classifier decides
+    // what runs — including calls to servers the person authorized. Band writes
+    // no permissions.ask rules: no --settings ever reaches the CLI, in any mode,
+    // with or without authorized servers. The permission route stays wired so
+    // whatever the CLI chooses to ask still arrives at the room, and the
+    // config encoder's own guards (no band shadow, no nameless entry) apply.
     const rigged = fakeClaudeProcesses();
     const claude = adapter(rigged, {
       permissionMode: "auto",
@@ -972,104 +978,9 @@ describe("ClaudeCliAdapter", () => {
       const prompted = room.say("owner", "one");
       const peer = await rigged.nextPeer();
       expect(argPair(peer.options.command, "--permission-mode"), "auto must reach the CLI as its own name").toBe("auto");
-      const settings = JSON.parse(argPair(peer.options.command, "--settings") ?? "null") as { permissions?: { ask?: string[] } } | null;
-      expect(settings?.permissions?.ask, "authorized servers are pinned to ask under auto").toEqual(["mcp__granted__*"]);
-      expect(Object.keys(mcpConfig(peer).mcpServers)).toEqual(["granted", "band"]);
-      peer.send(initResponse(String((await peer.controlRequest("initialize")).request_id), "2.1.319", "auto"));
-      await peer.scriptTurn(systemInit(), assistant(text("ok")), result({ result: "ok" }));
-      await prompted;
-      await promptedDone;
-    } finally {
-      await agent.stop();
-    }
-  });
-
-  it("writes the ask rule against the CLI's normalized server name, keeping the server", async () => {
-    // The installed CLI rewrites a server name before building tool names
-    // (2.1.319: every char outside [A-Za-z0-9_-] becomes "_"), so a rule written
-    // against the raw name matches nothing and the server runs unasked. The
-    // rule must name what the CLI will actually expose; the server stays.
-    const rigged = fakeClaudeProcesses();
-    const claude = adapter(rigged, {
-      permissionMode: "auto",
-      extraMcpServers: [
-        { name: "granted.live", type: "http", url: "https://granted.test/mcp", headers: [] },
-        { name: "weird name!", type: "http", url: "https://weird.test/mcp", headers: [] },
-      ],
-    });
-    const { agent, room } = await started(claude);
-    try {
-      const promptedDone = turnSettled(agent);
-      const prompted = room.say("owner", "one");
-      const peer = await rigged.nextPeer();
-      expect(Object.keys(mcpConfig(peer).mcpServers), "a rewritable name keeps its server").toEqual([
-        "granted.live",
-        "weird name!",
-        "band",
-      ]);
-      const settings = JSON.parse(argPair(peer.options.command, "--settings") ?? "null") as {
-        permissions?: { ask?: string[] };
-      };
-      expect(settings.permissions?.ask).toEqual(["mcp__granted_live__*", "mcp__weird_name___*"]);
-      peer.send(initResponse(String((await peer.controlRequest("initialize")).request_id), "2.1.319", "auto"));
-      await peer.scriptTurn(systemInit(), assistant(text("ok")), result({ result: "ok" }));
-      await prompted;
-      await promptedDone;
-    } finally {
-      await agent.stop();
-    }
-  });
-
-  for (const permissionMode of ["manual", "auto"] as const) {
-    it(`drops nameless servers and pins one rule per normalized namespace (${permissionMode})`, async () => {
-      const rigged = fakeClaudeProcesses();
-      const claude = adapter(rigged, {
-        permissionMode,
-        extraMcpServers: [
-          { name: "granted", type: "http", url: "https://granted.test/mcp", headers: [] },
-          // Usable string, but nothing left after trimming: it cannot be named
-          // at all, so it never reaches the CLI in any mode.
-          { name: "   ", type: "http", url: "https://blank.test/mcp", headers: [] },
-          // Two raw names, one CLI namespace: "a.b" and "a_b" are both served
-          // under mcp__a_b__*, so they share a single ask rule.
-          { name: "a.b", type: "http", url: "https://dot.test/mcp", headers: [] },
-          { name: "a_b", type: "http", url: "https://under.test/mcp", headers: [] },
-        ],
-      });
-      const { agent, room } = await started(claude);
-      try {
-        const promptedDone = turnSettled(agent);
-        const prompted = room.say("owner", "one");
-        const peer = await rigged.nextPeer();
-        expect(Object.keys(mcpConfig(peer).mcpServers)).toEqual(["granted", "a.b", "a_b", "band"]);
-        const settings = argPair(peer.options.command, "--settings");
-        if (permissionMode === "auto") {
-          expect(JSON.parse(settings ?? "null")).toEqual({
-            permissions: { ask: ["mcp__granted__*", "mcp__a_b__*"] },
-          });
-        } else {
-          expect(settings, "only auto needs the ask rules; other modes keep asking by themselves").toBeUndefined();
-        }
-        peer.send(initResponse(String((await peer.controlRequest("initialize")).request_id), "2.1.319", permissionMode === "manual" ? "default" : "auto"));
-        await peer.scriptTurn(systemInit(), assistant(text("ok")), result({ result: "ok" }));
-        await prompted;
-        await promptedDone;
-      } finally {
-        await agent.stop();
-      }
-    });
-  }
-
-  it("writes no settings document when auto has no authorized server to pin", async () => {
-    const rigged = fakeClaudeProcesses();
-    const claude = adapter(rigged, { permissionMode: "auto" });
-    const { agent, room } = await started(claude);
-    try {
-      const promptedDone = turnSettled(agent);
-      const prompted = room.say("owner", "one");
-      const peer = await rigged.nextPeer();
-      expect(argPair(peer.options.command, "--permission-mode")).toBe("auto");
-      expect(argPair(peer.options.command, "--settings"), "nothing to pin, nothing to declare").toBeUndefined();
+      expect(argPair(peer.options.command, "--settings"), "Band forces no asks under auto: no settings document").toBeUndefined();
+      expect(argPair(peer.options.command, "--permission-prompt-tool"), "the permission route must stay wired").toBe(`mcp__band__${PERMISSION_TOOL}`);
+      expect(Object.keys(mcpConfig(peer).mcpServers), "the authorized server passes through to the CLI").toEqual(["granted", "band"]);
       peer.send(initResponse(String((await peer.controlRequest("initialize")).request_id), "2.1.319", "auto"));
       await peer.scriptTurn(systemInit(), assistant(text("ok")), result({ result: "ok" }));
       await prompted;
@@ -1128,8 +1039,9 @@ describe("ClaudeCliAdapter", () => {
     expect(() => validateClaudeArgs(["--permission-prompt-tool", "mcp__evil__gate"])).toThrow(ValidationError);
     expect(() => validateClaudeArgs(["--setting-sources=user,project"])).toThrow(/reserved/);
     expect(() => validateClaudeArgs(["--no-session-persistence"])).toThrow(/reserved/);
-    // The adapter is the only writer of the settings document: its ask rules for
-    // authorized servers under auto cannot be replaced from the host side.
+    // The transport owns the settings surface: a host settings document could
+    // re-shape what the room is asked, so it stays reserved. Band itself never
+    // writes one (see "never forces asks with a settings document").
     expect(() => validateClaudeArgs(["--settings", "{}"])).toThrow(/reserved/);
     expect(() => new ClaudeCliAdapter({ command: ["claude", "--settings", '{"permissions":{"ask":[]}}'] })).toThrow(ValidationError);
     expect(validateClaudeArgs(["--include-partial-messages"])).toEqual(["--include-partial-messages"]);

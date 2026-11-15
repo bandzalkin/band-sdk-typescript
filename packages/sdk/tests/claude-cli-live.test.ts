@@ -406,11 +406,14 @@ describe.skipIf(!LIVE)("Claude CLI adapter against the installed CLI", () => {
     }
   }, 180_000);
 
-  it("auto still brings a person-authorized server call to the room", async () => {
-    // The adapter's promise behind offering auto: the CLI reviews native tools
-    // itself, but every tool of every authorized server stays pinned to the room's
-    // Approve by an ask rule (measured on 2.1.319). The marker proves the call ran;
-    // the prompt proves it asked first.
+  it("auto runs a person-authorized server call with the permission route wired and no forced asks", async () => {
+    // Owner decision 2026-11-15: under auto the CLI's own risk classifier decides
+    // everything, authorized servers included. Band forces no asks — it writes no
+    // --settings document. What the CLI chooses to ask still arrives over the
+    // wired --permission-prompt-tool. This case proves all three halves of that
+    // on the real CLI: no settings document on the command line, the permission
+    // route wired, and the call reaching the fixture server (whether the CLI
+    // asked first or not — asking is its decision, not ours).
     const server = new BandMcpServer({
       name: "granted-live",
       tools: () => undefined,
@@ -442,85 +445,26 @@ describe.skipIf(!LIVE)("Claude CLI adapter against the installed CLI", () => {
     try {
       const ended = run.turnEnd();
       const posted = run.room.say("owner", 'Call the tool named mcp__granted__probe_fetch exactly once with argument {"q":"live"}. It answers a short marker string; that is expected. Then reply with the single word DONE.');
+      // Asking is the CLI's decision; answering is the room's, whenever it asks.
       const prompt = await run.askedOrEnded();
-      if (!prompt) {
-        throw new Error(`NO ASK: auto ran the authorized-server call without the room: ${record(run)}`);
+      if (prompt) {
+        expect(prompt.toolName, `the room was asked about ${prompt.toolName}, not the authorized server`).toContain("granted");
+        run.decide({ behavior: "allow", updatedInput: (prompt.input ?? {}) as Record<string, unknown> });
       }
-      expect(prompt.toolName, `the room was asked about ${prompt.toolName}, not the authorized server`).toContain("granted");
-      // The pinning itself must be on the command line, not merely observed.
-      const command = (run.launches[0] ?? []).join(" ");
-      expect(command, `auto was not passed to the CLI: ${command}`).toContain("--permission-mode auto");
-      const settingsIndex = (run.launches[0] ?? []).indexOf("--settings");
-      expect(settingsIndex, `no settings document pinned the authorized server: ${command}`).toBeGreaterThan(-1);
-      const settings = JSON.parse(run.launches[0]![settingsIndex + 1]!) as { permissions?: { ask?: string[] } };
-      expect(settings.permissions?.ask, `the authorized server was not pinned to ask: ${JSON.stringify(settings)}`).toContain("mcp__granted__*");
-      run.decide({ behavior: "allow", updatedInput: (prompt.input ?? {}) as Record<string, unknown> });
       await posted;
-      await ended;
+      const end = await ended;
+      expect(end.type, `the auto turn did not complete: ${record(run)}`).toBe("turn.completed");
+      // Whatever the CLI decided about asking, the command line must show Band
+      // forced nothing and wired everything.
+      const launch = run.launches[0] ?? [];
+      const command = launch.join(" ");
+      expect(command, `auto was not passed to the CLI: ${command}`).toContain("--permission-mode auto");
+      expect(launch, `Band forced asks with a settings document: ${command}`).not.toContain("--settings");
+      expect(command, `the permission route was not wired: ${command}`).toContain("--permission-prompt-tool mcp__band__band_permission_decision");
       expect(
         JSON.stringify(run.room.events("tool_result")),
         `the authorized call never reached the fixture server: ${record(run)}`,
       ).toContain("GRANTED-MARK-live");
-    } finally {
-      await run.agent.stop();
-      await server.stop();
-      rmSync(ws, { recursive: true, force: true });
-    }
-  }, 240_000);
-
-  it("auto still brings an authorized server with a rewritten name to the room", async () => {
-    // The CLI rewrites server names for tool ids (2.1.319: [^A-Za-z0-9_-] -> "_"),
-    // so an ask rule written against the raw name matches nothing and the server
-    // runs unasked. This case pins the rule to the CLI's own normalized name by
-    // using a name that MUST be rewritten: "granted.live" is served as
-    // "mcp__granted_live__probe_fetch". Every live run re-proves the rewrite.
-    const server = new BandMcpServer({
-      name: "granted-live-dot",
-      tools: () => undefined,
-      additionalTools: [
-        {
-          name: "probe_fetch",
-          description: "Returns a fixed marker. Proves the rewritten-name path.",
-          inputSchema: { type: "object", properties: { q: { type: "string" } }, required: ["q"] },
-          execute: async (args: Record<string, unknown>) => ({
-            content: [{ type: "text", text: `GRANTED-MARK-${String(args["q"] ?? "?")}` }],
-          }),
-        },
-      ],
-    });
-    await server.start();
-    const ws = mkdtempSync(join(tmpdir(), "band-live-auto-dotted-"));
-    const run = await liveOrReport({
-      permissionMode: "auto",
-      workspaceForRoom: () => ws,
-      extraMcpServers: [
-        {
-          name: "granted.live",
-          type: "http",
-          url: server.url!,
-          headers: [{ name: "Authorization", value: "Bearer live-probe-token" }],
-        },
-      ],
-    });
-    try {
-      const ended = run.turnEnd();
-      const posted = run.room.say("owner", 'Call the tool named mcp__granted_live__probe_fetch exactly once with argument {"q":"dot"}. It answers a short marker string; that is expected. Then reply with the single word DONE.');
-      const prompt = await run.askedOrEnded();
-      if (!prompt) {
-        throw new Error(`NO ASK: auto ran the rewritten-name authorized call without the room: ${record(run)}`);
-      }
-      expect(prompt.toolName, `the room was asked about ${prompt.toolName}`).toContain("granted");
-      const settingsIndex = (run.launches[0] ?? []).indexOf("--settings");
-      expect(settingsIndex, `no settings document pinned the rewritten name: ${(run.launches[0] ?? []).join(" ")}`).toBeGreaterThan(-1);
-      const settings = JSON.parse(run.launches[0]![settingsIndex + 1]!) as { permissions?: { ask?: string[] } };
-      expect(settings.permissions?.ask, `the rule must name the CLI's own tool namespace`).toContain("mcp__granted_live__*");
-      run.decide({ behavior: "allow", updatedInput: (prompt.input ?? {}) as Record<string, unknown> });
-      await posted;
-      await ended;
-      expect(
-        JSON.stringify(run.room.events("tool_result")),
-        `the rewritten-name call never reached the fixture server: ${record(run)}`,
-      ).toContain("GRANTED-MARK-dot");
     } finally {
       await run.agent.stop();
       await server.stop();
