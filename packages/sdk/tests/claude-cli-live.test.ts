@@ -468,6 +468,66 @@ describe.skipIf(!LIVE)("Claude CLI adapter against the installed CLI", () => {
     }
   }, 240_000);
 
+  it("auto still brings an authorized server with a rewritten name to the room", async () => {
+    // The CLI rewrites server names for tool ids (2.1.319: [^A-Za-z0-9_-] -> "_"),
+    // so an ask rule written against the raw name matches nothing and the server
+    // runs unasked. This case pins the rule to the CLI's own normalized name by
+    // using a name that MUST be rewritten: "granted.live" is served as
+    // "mcp__granted_live__probe_fetch". Every live run re-proves the rewrite.
+    const server = new BandMcpServer({
+      name: "granted-live-dot",
+      tools: () => undefined,
+      additionalTools: [
+        {
+          name: "probe_fetch",
+          description: "Returns a fixed marker. Proves the rewritten-name path.",
+          inputSchema: { type: "object", properties: { q: { type: "string" } }, required: ["q"] },
+          execute: async (args: Record<string, unknown>) => ({
+            content: [{ type: "text", text: `GRANTED-MARK-${String(args["q"] ?? "?")}` }],
+          }),
+        },
+      ],
+    });
+    await server.start();
+    const ws = mkdtempSync(join(tmpdir(), "band-live-auto-dotted-"));
+    const run = await liveOrReport({
+      permissionMode: "auto",
+      workspaceForRoom: () => ws,
+      extraMcpServers: [
+        {
+          name: "granted.live",
+          type: "http",
+          url: server.url!,
+          headers: [{ name: "Authorization", value: "Bearer live-probe-token" }],
+        },
+      ],
+    });
+    try {
+      const ended = run.turnEnd();
+      const posted = run.room.say("owner", 'Call the tool named mcp__granted_live__probe_fetch exactly once with argument {"q":"dot"}. It answers a short marker string; that is expected. Then reply with the single word DONE.');
+      const prompt = await run.askedOrEnded();
+      if (!prompt) {
+        throw new Error(`NO ASK: auto ran the rewritten-name authorized call without the room: ${record(run)}`);
+      }
+      expect(prompt.toolName, `the room was asked about ${prompt.toolName}`).toContain("granted");
+      const settingsIndex = (run.launches[0] ?? []).indexOf("--settings");
+      expect(settingsIndex, `no settings document pinned the rewritten name: ${(run.launches[0] ?? []).join(" ")}`).toBeGreaterThan(-1);
+      const settings = JSON.parse(run.launches[0]![settingsIndex + 1]!) as { permissions?: { ask?: string[] } };
+      expect(settings.permissions?.ask, `the rule must name the CLI's own tool namespace`).toContain("mcp__granted_live__*");
+      run.decide({ behavior: "allow", updatedInput: (prompt.input ?? {}) as Record<string, unknown> });
+      await posted;
+      await ended;
+      expect(
+        JSON.stringify(run.room.events("tool_result")),
+        `the rewritten-name call never reached the fixture server: ${record(run)}`,
+      ).toContain("GRANTED-MARK-dot");
+    } finally {
+      await run.agent.stop();
+      await server.stop();
+      rmSync(ws, { recursive: true, force: true });
+    }
+  }, 240_000);
+
   it("reports the files a probe left behind, so a failure can be read", async () => {
     const leftovers = readdirSync(tmpdir()).filter((name) => name.startsWith("band-approval-") || name.startsWith("band-stop-"));
     expect(leftovers, `probe directories survived: ${leftovers.join(", ")}`).toEqual([]);

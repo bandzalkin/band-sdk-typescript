@@ -88,16 +88,20 @@ export const RESERVED_CLAUDE_FLAGS = [
 ] as const;
 
 /**
- * A server name the CLI's rule matcher can be given meaningfully: the ask rule
- * for `mcp__<name>__*` is only as trustworthy as the name's character set. Any
- * other name cannot be force-asked, so the server cannot be trusted to ask on
- * its own, and an unaskable authorized server never reaches the CLI at all.
+ * The name the CLI will expose a server's tools under. Claude Code 2.1.319
+ * rewrites every character outside [A-Za-z0-9_-] to "_" before building tool
+ * names, so an ask rule written against the raw name can match nothing — a
+ * server named `granted.live` is served as `mcp__granted_live__*`, and a rule
+ * for `mcp__granted.live__*` leaves it running unasked. Rules must name what
+ * the CLI names.
  */
-const AUTHORIZED_SERVER_NAME = /^[A-Za-z0-9._:@-]+$/u;
+function claudeNormalizedServerName(name: string): string {
+  return name.replace(/[^A-Za-z0-9_-]/gu, "_");
+}
 
 /** The CLI's `permissions.ask` entry pinning one authorized server's tools to a prompt. */
 function authorizedAskRule(name: string): string {
-  return `mcp__${name}__*`;
+  return `mcp__${claudeNormalizedServerName(name)}__*`;
 }
 
 const DEFAULT_PERMISSION_TIMEOUT_MS = 5 * 60_000;
@@ -853,15 +857,22 @@ export class ClaudeCliRoomAgent extends SimpleAdapter<ClaudeCliSessionState, Tur
     backend: BandMcpBackend,
     authorizedServers: readonly McpServer[],
   ): string[] {
-    // An authorized server whose name cannot be given a trustworthy ask rule is
-    // dropped in every mode, not just auto: a server the room cannot force to ask
-    // is a server the room must not hand the CLI at all. Counted in the log, never
-    // named — same doctrine as a failed token host.
+    // Only two kinds of authorized server never reach the CLI, in any mode: one
+    // with no usable name at all, and one whose CLI-normalized name would equal
+    // Band's own server (its tools would sit inside the room's own namespace and
+    // an ask rule for it would pin the room's approval tool — under the 2.1.319
+    // rewrite only the raw name "band" can get there, which the config encoder
+    // already refuses; this catches it should that rewrite ever change).
+    // Every other name is pinned through normalization, not dropped. Counted in
+    // the log, never named — same doctrine as a failed token host.
     const askable = authorizedServers.filter(
-      (server) => typeof server?.name === "string" && AUTHORIZED_SERVER_NAME.test(server.name.trim()),
+      (server) =>
+        typeof server?.name === "string" &&
+        server.name.trim() !== "" &&
+        claudeNormalizedServerName(server.name.trim()) !== MCP_SERVER_NAME,
     );
     if (askable.length !== authorizedServers.length) {
-      this.logger.warn("claude_cli.authorized_server_name_unaskable", {
+      this.logger.warn("claude_cli.authorized_server_name_unusable", {
         roomId: this.roomId,
         dropped: authorizedServers.length - askable.length,
       });
@@ -918,7 +929,9 @@ export class ClaudeCliRoomAgent extends SimpleAdapter<ClaudeCliSessionState, Tur
     // every call to one still reaches the room's Approve. The ask rules below are
     // how that is forced; the CLI honours them under auto (measured on 2.1.319).
     if (this.permissionMode === "auto" && askable.length > 0) {
-      const ask = askable.map((server) => authorizedAskRule(server.name.trim()));
+      // Two raw names can normalize alike ("a.b" and "a_b" share one tool
+      // namespace); the rule is stated once and pins both.
+      const ask = [...new Set(askable.map((server) => authorizedAskRule(server.name.trim())))];
       args.push("--settings", JSON.stringify({ permissions: { ask } }));
     }
     return args;
