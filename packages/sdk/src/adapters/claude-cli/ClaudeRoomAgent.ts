@@ -81,10 +81,6 @@ export const RESERVED_CLAUDE_FLAGS = [
   "--dangerously-skip-permissions",
   "--allow-dangerously-skip-permissions",
   "--tools",
-  // The transport owns the settings surface: a settings document can re-shape
-  // what the room is asked — permission rules, and a default mode that answers
-  // for the room — so host arguments must not be able to write one.
-  "--settings",
 ] as const;
 
 const DEFAULT_PERMISSION_TIMEOUT_MS = 5 * 60_000;

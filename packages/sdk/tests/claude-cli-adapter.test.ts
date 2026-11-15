@@ -958,13 +958,13 @@ describe("ClaudeCliAdapter", () => {
     }
   });
 
-  it("passes auto through and never forces asks with a settings document", async () => {
+  it("passes auto through under its own name and keeps the permission route wired", async () => {
     // Owner decision 2026-11-15: under auto the CLI's own risk classifier decides
-    // what runs — including calls to servers the person authorized. Band writes
-    // no permissions.ask rules: no --settings ever reaches the CLI, in any mode,
-    // with or without authorized servers. The permission route stays wired so
-    // whatever the CLI chooses to ask still arrives at the room, and the
-    // config encoder's own guards (no band shadow, no nameless entry) apply.
+    // what runs — including calls to servers the person authorized. Band forces
+    // no asks; the mapping must still hand "auto" over unchanged, wire the
+    // permission route for whatever the CLI chooses to ask, and pass authorized
+    // servers to the CLI as they were before task 25 (the encoder's own guards
+    // apply — no band shadow, no nameless entry).
     const rigged = fakeClaudeProcesses();
     const claude = adapter(rigged, {
       permissionMode: "auto",
@@ -978,7 +978,6 @@ describe("ClaudeCliAdapter", () => {
       const prompted = room.say("owner", "one");
       const peer = await rigged.nextPeer();
       expect(argPair(peer.options.command, "--permission-mode"), "auto must reach the CLI as its own name").toBe("auto");
-      expect(argPair(peer.options.command, "--settings"), "Band forces no asks under auto: no settings document").toBeUndefined();
       expect(argPair(peer.options.command, "--permission-prompt-tool"), "the permission route must stay wired").toBe(`mcp__band__${PERMISSION_TOOL}`);
       expect(Object.keys(mcpConfig(peer).mcpServers), "the authorized server passes through to the CLI").toEqual(["granted", "band"]);
       peer.send(initResponse(String((await peer.controlRequest("initialize")).request_id), "2.1.319", "auto"));
@@ -1039,11 +1038,6 @@ describe("ClaudeCliAdapter", () => {
     expect(() => validateClaudeArgs(["--permission-prompt-tool", "mcp__evil__gate"])).toThrow(ValidationError);
     expect(() => validateClaudeArgs(["--setting-sources=user,project"])).toThrow(/reserved/);
     expect(() => validateClaudeArgs(["--no-session-persistence"])).toThrow(/reserved/);
-    // The transport owns the settings surface: a host settings document could
-    // re-shape what the room is asked, so it stays reserved. Band itself never
-    // writes one (see "never forces asks with a settings document").
-    expect(() => validateClaudeArgs(["--settings", "{}"])).toThrow(/reserved/);
-    expect(() => new ClaudeCliAdapter({ command: ["claude", "--settings", '{"permissions":{"ask":[]}}'] })).toThrow(ValidationError);
     expect(validateClaudeArgs(["--include-partial-messages"])).toEqual(["--include-partial-messages"]);
     expect(() => new ClaudeCliAdapter({ command: ["claude", "--dangerously-skip-permissions"] })).toThrow(ValidationError);
   });
