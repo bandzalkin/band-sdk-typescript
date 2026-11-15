@@ -984,14 +984,56 @@ describe("ClaudeCliAdapter", () => {
     }
   });
 
+  it("writes the ask rule against the CLI's normalized server name, keeping the server", async () => {
+    // The installed CLI rewrites a server name before building tool names
+    // (2.1.319: every char outside [A-Za-z0-9_-] becomes "_"), so a rule written
+    // against the raw name matches nothing and the server runs unasked. The
+    // rule must name what the CLI will actually expose; the server stays.
+    const rigged = fakeClaudeProcesses();
+    const claude = adapter(rigged, {
+      permissionMode: "auto",
+      extraMcpServers: [
+        { name: "granted.live", type: "http", url: "https://granted.test/mcp", headers: [] },
+        { name: "weird name!", type: "http", url: "https://weird.test/mcp", headers: [] },
+      ],
+    });
+    const { agent, room } = await started(claude);
+    try {
+      const promptedDone = turnSettled(agent);
+      const prompted = room.say("owner", "one");
+      const peer = await rigged.nextPeer();
+      expect(Object.keys(mcpConfig(peer).mcpServers), "a rewritable name keeps its server").toEqual([
+        "granted.live",
+        "weird name!",
+        "band",
+      ]);
+      const settings = JSON.parse(argPair(peer.options.command, "--settings") ?? "null") as {
+        permissions?: { ask?: string[] };
+      };
+      expect(settings.permissions?.ask).toEqual(["mcp__granted_live__*", "mcp__weird_name___*"]);
+      peer.send(initResponse(String((await peer.controlRequest("initialize")).request_id), "2.1.319", "auto"));
+      await peer.scriptTurn(systemInit(), assistant(text("ok")), result({ result: "ok" }));
+      await prompted;
+      await promptedDone;
+    } finally {
+      await agent.stop();
+    }
+  });
+
   for (const permissionMode of ["manual", "auto"] as const) {
-    it(`drops an authorized server whose name cannot be given a trustworthy ask rule (${permissionMode})`, async () => {
+    it(`drops nameless servers and pins one rule per normalized namespace (${permissionMode})`, async () => {
       const rigged = fakeClaudeProcesses();
       const claude = adapter(rigged, {
         permissionMode,
         extraMcpServers: [
           { name: "granted", type: "http", url: "https://granted.test/mcp", headers: [] },
-          { name: "weird name!", type: "http", url: "https://weird.test/mcp", headers: [] },
+          // Usable string, but nothing left after trimming: it cannot be named
+          // at all, so it never reaches the CLI in any mode.
+          { name: "   ", type: "http", url: "https://blank.test/mcp", headers: [] },
+          // Two raw names, one CLI namespace: "a.b" and "a_b" are both served
+          // under mcp__a_b__*, so they share a single ask rule.
+          { name: "a.b", type: "http", url: "https://dot.test/mcp", headers: [] },
+          { name: "a_b", type: "http", url: "https://under.test/mcp", headers: [] },
         ],
       });
       const { agent, room } = await started(claude);
@@ -999,12 +1041,12 @@ describe("ClaudeCliAdapter", () => {
         const promptedDone = turnSettled(agent);
         const prompted = room.say("owner", "one");
         const peer = await rigged.nextPeer();
-        // An unaskable server never reaches the CLI in any mode: the room cannot
-        // force it to ask, so it must not be present when auto asks nothing.
-        expect(Object.keys(mcpConfig(peer).mcpServers)).toEqual(["granted", "band"]);
+        expect(Object.keys(mcpConfig(peer).mcpServers)).toEqual(["granted", "a.b", "a_b", "band"]);
         const settings = argPair(peer.options.command, "--settings");
         if (permissionMode === "auto") {
-          expect(JSON.parse(settings ?? "null")).toEqual({ permissions: { ask: ["mcp__granted__*"] } });
+          expect(JSON.parse(settings ?? "null")).toEqual({
+            permissions: { ask: ["mcp__granted__*", "mcp__a_b__*"] },
+          });
         } else {
           expect(settings, "only auto needs the ask rules; other modes keep asking by themselves").toBeUndefined();
         }
