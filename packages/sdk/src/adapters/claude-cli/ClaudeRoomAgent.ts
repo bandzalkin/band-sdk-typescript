@@ -80,29 +80,12 @@ export const RESERVED_CLAUDE_FLAGS = [
   "--bare",
   "--dangerously-skip-permissions",
   "--allow-dangerously-skip-permissions",
-  "--permission-mode",
   "--tools",
-  // The adapter is the only writer of the settings document: its ask rules for
-  // authorized servers under auto must not be replaceable by host arguments.
+  // The transport owns the settings surface: a settings document can re-shape
+  // what the room is asked — permission rules, and a default mode that answers
+  // for the room — so host arguments must not be able to write one.
   "--settings",
 ] as const;
-
-/**
- * The name the CLI will expose a server's tools under. Claude Code 2.1.319
- * rewrites every character outside [A-Za-z0-9_-] to "_" before building tool
- * names, so an ask rule written against the raw name can match nothing — a
- * server named `granted.live` is served as `mcp__granted_live__*`, and a rule
- * for `mcp__granted.live__*` leaves it running unasked. Rules must name what
- * the CLI names.
- */
-function claudeNormalizedServerName(name: string): string {
-  return name.replace(/[^A-Za-z0-9_-]/gu, "_");
-}
-
-/** The CLI's `permissions.ask` entry pinning one authorized server's tools to a prompt. */
-function authorizedAskRule(name: string): string {
-  return `mcp__${claudeNormalizedServerName(name)}__*`;
-}
 
 const DEFAULT_PERMISSION_TIMEOUT_MS = 5 * 60_000;
 const DEFAULT_TURN_TIMEOUT_MS = 60 * 60_000;
@@ -181,10 +164,13 @@ export interface ClaudeCliAdapterOptions {
   effort?: "low" | "medium" | "high" | "xhigh" | "max";
   /**
    * The CLI's own permission mode. `manual` is accepted and mapped to `default`.
-   * `auto` asks nothing of the room for native tools — the CLI reviews them — so
-   * a room started with it keeps one promise by force: every tool of every
-   * person-authorized server is pinned to ask through the room's Approve with a
-   * `permissions.ask` rule the CLI itself honours under auto (measured on 2.1.319).
+   * `auto` hands every decision to the CLI's risk classifier — reads, edits,
+   * out-of-workspace commands, network calls and calls to servers the person
+   * authorized alike. Band forces no asks there (owner decision 2026-11-15): the
+   * room sees only what the CLI chooses to ask, and whatever it asks arrives over
+   * the room's permission tool. The CLI must report the requested mode back at
+   * `initialize` or the room refuses to start. `bypassPermissions` is never
+   * offered.
    */
   permissionMode?: "default" | "acceptEdits" | "plan" | "dontAsk" | "manual" | "auto";
   /** Directories or archives the CLI loads as plugins for this session. */
@@ -857,29 +843,9 @@ export class ClaudeCliRoomAgent extends SimpleAdapter<ClaudeCliSessionState, Tur
     backend: BandMcpBackend,
     authorizedServers: readonly McpServer[],
   ): string[] {
-    // Only two kinds of authorized server never reach the CLI, in any mode: one
-    // with no usable name at all, and one whose CLI-normalized name would equal
-    // Band's own server (its tools would sit inside the room's own namespace and
-    // an ask rule for it would pin the room's approval tool — under the 2.1.319
-    // rewrite only the raw name "band" can get there, which the config encoder
-    // already refuses; this catches it should that rewrite ever change).
-    // Every other name is pinned through normalization, not dropped. Counted in
-    // the log, never named — same doctrine as a failed token host.
-    const askable = authorizedServers.filter(
-      (server) =>
-        typeof server?.name === "string" &&
-        server.name.trim() !== "" &&
-        claudeNormalizedServerName(server.name.trim()) !== MCP_SERVER_NAME,
-    );
-    if (askable.length !== authorizedServers.length) {
-      this.logger.warn("claude_cli.authorized_server_name_unusable", {
-        roomId: this.roomId,
-        dropped: authorizedServers.length - askable.length,
-      });
-    }
     const config = encodeMcpConfig(
       { type: "http", url: bandUrl, headers: { Authorization: `Bearer ${backend.authToken ?? ""}` } },
-      askable,
+      authorizedServers,
     );
     const args = [
       ...this.command,
@@ -924,16 +890,6 @@ export class ClaudeCliRoomAgent extends SimpleAdapter<ClaudeCliSessionState, Tur
       args.push("--allowedTools", ...approved);
     }
     args.push("--disallowedTools", ...DENIED_CLAUDE_CLI_TOOLS);
-    // Under auto the CLI reviews native tools itself and asks the room nothing.
-    // The person's authorized servers are the one class that must keep asking —
-    // every call to one still reaches the room's Approve. The ask rules below are
-    // how that is forced; the CLI honours them under auto (measured on 2.1.319).
-    if (this.permissionMode === "auto" && askable.length > 0) {
-      // Two raw names can normalize alike ("a.b" and "a_b" share one tool
-      // namespace); the rule is stated once and pins both.
-      const ask = [...new Set(askable.map((server) => authorizedAskRule(server.name.trim())))];
-      args.push("--settings", JSON.stringify({ permissions: { ask } }));
-    }
     return args;
   }
 
